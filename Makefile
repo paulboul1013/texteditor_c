@@ -1,5 +1,4 @@
-
-CFLAGS = -Wall  -Werror -pedantic -std=c99
+CFLAGS = -Wall -Wextra  -Werror -pedantic -std=c99
 
 
 main: main.c
