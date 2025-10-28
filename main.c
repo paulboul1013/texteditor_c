@@ -108,6 +108,37 @@ void print_with_line_numbers(char *buffer, int highlight_line){
     printf("==============================\n\n");
 }
 
+// 在指定行之後插入新行
+void insert_new_line(char *buffer, int after_line){
+    // 找到插入位置
+    char *insert_pos = buffer;
+    
+    if(after_line > 0){
+        for (int i = 0; i < after_line; i++){
+            char *next = strchr(insert_pos, '\n');
+            if(next){
+                insert_pos = next + 1;
+            } else {
+                // 如果到了文件末尾但沒有換行符，先添加一個
+                insert_pos = buffer + strlen(buffer);
+                break;
+            }
+        }
+    }
+    
+    // 保存插入位置之後的內容
+    char after_content[512] = {0};
+    strcpy(after_content, insert_pos);
+    
+    // 在插入位置添加新行（空行加換行符）
+    strcpy(insert_pos, "\n");
+    strcpy(insert_pos + 1, after_content);
+    
+    printf("\n✓ 已在第 %d 行之後插入新行\n", after_line);
+    printf("按任意鍵繼續...");
+    read_key();
+}
+
 void edit_line(char *buffer, int current_line){
     // 找到要編輯的行
     char *line_ptr = buffer;
@@ -167,7 +198,7 @@ void edit_line(char *buffer, int current_line){
         }
         
         printf("\n└─────────────────────────────────────────┘\n");
-        printf("\n光標位置：%d/%d\n", cursor_pos, content_len);
+        // printf("\n光標位置：%d/%d\n", cursor_pos, content_len);
         
         // 讀取按鍵
         char key = read_key();
@@ -258,6 +289,7 @@ int main(int argc,char **argv){
     printf("操作說明：\n");
     printf("  ↑/↓   - 上下移動選擇行\n");
     printf("  Enter - 進入編輯模式\n");
+    printf("  n     - 在當前行之後新增一行\n");
     printf("  q     - 退出編輯器\n\n");
     printf("編輯模式功能：\n");
     printf("  ←/→      - 左右移動光標\n");
@@ -281,7 +313,7 @@ int main(int argc,char **argv){
         // 顯示提示信息
         printf("\n");
         printf("當前選擇：第 %d 行 (共 %d 行)\n", current_line, total_lines);
-        printf("操作：[↑↓] 移動  [Enter] 編輯  [q] 退出\n");
+        printf("操作：[↑↓] 移動  [Enter] 編輯  [n] 新增行  [q] 退出\n");
         
         // 讀取按鍵
         char key = read_key();
@@ -305,7 +337,30 @@ int main(int argc,char **argv){
                 current_line++;
             }
         }
-
+        else if(key == 'n' || key == 'N'){
+            // 在當前行之後新增一行
+            clear_screen();
+            print_with_line_numbers(buffer, current_line);
+            
+            insert_new_line(buffer, current_line);
+            
+            // 自動保存
+            file = fopen(filename, "w");
+            fwrite(buffer, strlen(buffer), 1, file);
+            fclose(file);
+            
+            // 重新計算行數
+            total_lines = count_lines(buffer);
+            // 移動到新插入的行
+            current_line++;
+            if(current_line > total_lines){
+                current_line = total_lines;
+            }
+        }
+        else if(key == 'L' || key == 'R'){
+            // 左右鍵在主選單中不執行任何操作（僅在編輯模式中使用）
+            // 忽略這些按鍵，避免未處理的輸入
+        }
         else if(key == '\r' || key == '\n'){
             // Enter - 編輯當前行
             clear_screen();
