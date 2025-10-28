@@ -38,6 +38,8 @@ char read_key() {
         if (seq[0] == '[') {
             if (seq[1] == 'A') return 'U'; // Up arrow
             if (seq[1] == 'B') return 'D'; // Down arrow
+            if (seq[1] == 'C') return 'R'; // Right arrow
+            if (seq[1] == 'D') return 'L'; // Left arrow
         }
     }
     
@@ -106,34 +108,126 @@ void print_with_line_numbers(char *buffer, int highlight_line){
     printf("==============================\n\n");
 }
 
-void edit_line(char *buffer,int current_line){
-    // 暫時關閉 raw mode 以便正常輸入
-    disable_raw_mode();
-    
-    for (int i=0;i<current_line-1;i++){
-        buffer=strchr(buffer,'\n')+1;
+void edit_line(char *buffer, int current_line){
+    // 找到要編輯的行
+    char *line_ptr = buffer;
+    for (int i = 0; i < current_line - 1; i++){
+        line_ptr = strchr(line_ptr, '\n') + 1;
     }
     
-    char *line_end=strchr(buffer,'\n');
-    char saved[1024]={0};
-    strcpy(saved,line_end);
+    // 找到行尾
+    char *line_end = strchr(line_ptr, '\n');
+    int line_length = line_end ? (int)(line_end - line_ptr) : (int)strlen(line_ptr);
     
-    printf("\n>>> 編輯模式 - 行 %d <<<\n", current_line);
-    printf("目前內容: ");
-    char *temp = strchr(buffer, '\n');
-    if(temp){
-        printf("%.*s\n", (int)(temp - buffer), buffer);
+    // 複製當前行內容到臨時緩衝區
+    char line_content[512] = {0};
+    strncpy(line_content, line_ptr, line_length);
+    
+    // 保存行後面的內容
+    char after_line[512] = {0};
+    if(line_end){
+        strcpy(after_line, line_end);
     }
-    printf("輸入新內容: ");
-    scanf("%s",buffer);
-    strcpy(buffer+strlen(buffer),saved);
     
-    printf("\n✓ 已更新行 %d\n", current_line);
-    printf("按任意鍵繼續...");
+    int cursor_pos = line_length;  // 光標位置（從行尾開始）
+    int content_len = line_length;
     
-    // 重新啟用 raw mode
-    enable_raw_mode();
-    read_key();
+    // 編輯循環
+    while(1){
+        // 清除屏幕並顯示編輯界面
+        clear_screen();
+        printf("╔═══════════════════════════════════════════╗\n");
+        printf("║       編輯模式 - 行 %d                    ║\n", current_line);
+        printf("╚═══════════════════════════════════════════╝\n\n");
+        printf("操作說明：\n");
+        printf("  ←/→      - 左右移動光標\n");
+        printf("  Backspace - 刪除光標前的字符\n");
+        printf("  任意字符  - 在光標位置插入\n");
+        printf("  Enter    - 完成編輯\n");
+        printf("  ESC      - 取消編輯\n\n");
+        
+        printf("編輯內容：\n");
+        printf("┌─────────────────────────────────────────┐\n");
+        printf("│ ");
+        
+        // 顯示內容，在光標位置顯示特殊標記
+        for(int i = 0; i < content_len; i++){
+            if(i == cursor_pos){
+                printf("\033[7m"); // 反色顯示光標位置
+            }
+            printf("%c", line_content[i]);
+            if(i == cursor_pos){
+                printf("\033[0m"); // 重置顏色
+            }
+        }
+        
+        // 如果光標在最後，顯示空格光標
+        if(cursor_pos == content_len){
+            printf("\033[7m \033[0m");
+        }
+        
+        printf("\n└─────────────────────────────────────────┘\n");
+        printf("\n光標位置：%d/%d\n", cursor_pos, content_len);
+        
+        // 讀取按鍵
+        char key = read_key();
+        
+        if(key == '\r' || key == '\n'){
+            // Enter - 完成編輯
+            line_content[content_len] = '\0';
+            strcpy(line_ptr, line_content);
+            strcpy(line_ptr + content_len, after_line);
+            
+            clear_screen();
+            printf("\n✓ 已更新行 %d\n", current_line);
+            printf("按任意鍵繼續...");
+            read_key();
+            break;
+        }
+        else if(key == '\033'){
+            // ESC - 取消編輯
+            clear_screen();
+            printf("\n✗ 已取消編輯\n");
+            printf("按任意鍵繼續...");
+            read_key();
+            break;
+        }
+        else if(key == 'L'){
+            // 左移光標
+            if(cursor_pos > 0){
+                cursor_pos--;
+            }
+        }
+        else if(key == 'R'){
+            // 右移光標
+            if(cursor_pos < content_len){
+                cursor_pos++;
+            }
+        }
+        else if(key == 127 || key == '\b'){
+            // Backspace - 刪除光標前的字符
+            if(cursor_pos > 0){
+                // 將光標後的內容前移
+                for(int i = cursor_pos - 1; i < content_len; i++){
+                    line_content[i] = line_content[i + 1];
+                }
+                cursor_pos--;
+                content_len--;
+            }
+        }
+        else if(key >= 32 && key <= 126){
+            // 可打印字符 - 在光標位置插入
+            if(content_len < 510){
+                // 將光標後的內容後移
+                for(int i = content_len; i > cursor_pos; i--){
+                    line_content[i] = line_content[i - 1];
+                }
+                line_content[cursor_pos] = key;
+                cursor_pos++;
+                content_len++;
+            }
+        }
+    }
 }
 
 int main(int argc,char **argv){
@@ -162,9 +256,13 @@ int main(int argc,char **argv){
     printf("║       文本編輯器 - 鍵盤導航模式          ║\n");
     printf("╚═══════════════════════════════════════════╝\n\n");
     printf("操作說明：\n");
-    printf("  ↑/↓  - 上下移動選擇行\n");
-    printf("  Enter - 編輯選中的行\n");
+    printf("  ↑/↓   - 上下移動選擇行\n");
+    printf("  Enter - 進入編輯模式\n");
     printf("  q     - 退出編輯器\n\n");
+    printf("編輯模式功能：\n");
+    printf("  ←/→      - 左右移動光標\n");
+    printf("  字符輸入  - 在光標位置插入\n");
+    printf("  Backspace - 刪除字符\n\n");
     printf("按任意鍵開始...\n");
     read_key();
     
@@ -207,6 +305,7 @@ int main(int argc,char **argv){
                 current_line++;
             }
         }
+
         else if(key == '\r' || key == '\n'){
             // Enter - 編輯當前行
             clear_screen();
