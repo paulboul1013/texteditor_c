@@ -162,6 +162,57 @@ void insert_new_line(char *buffer, int after_line){
     read_key();
 }
 
+// 刪除指定行
+int delete_line(char *buffer, int line_to_delete){
+    // 如果文件只有一行，不允許刪除
+    int total = count_lines(buffer);
+    if(total <= 1){
+        printf("\n✗ 無法刪除：文件至少需要保留一行\n");
+        printf("按任意鍵繼續...");
+        read_key();
+        return 0;  // 刪除失敗
+    }
+    
+    // 找到要刪除的行的起始位置
+    char *line_start = buffer;
+    for(int i = 0; i < line_to_delete - 1; i++){
+        char *next = strchr(line_start, '\n');
+        if(next){
+            line_start = next + 1;
+        } else {
+            printf("\n✗ 錯誤：找不到指定行\n");
+            printf("按任意鍵繼續...");
+            read_key();
+            return 0;
+        }
+    }
+    
+    // 找到要刪除的行的結束位置（下一個換行符）
+    char *line_end = strchr(line_start, '\n');
+    
+    // 保存要刪除行之後的內容
+    char after_content[512] = {0};
+    if(line_end){
+        // 如果找到換行符，保存換行符之後的所有內容
+        strcpy(after_content, line_end + 1);
+        // 將刪除行之後的內容複製到刪除行的起始位置
+        strcpy(line_start, after_content);
+    } else {
+        // 如果這是最後一行且沒有換行符
+        // 需要刪除前一個換行符
+        if(line_start > buffer && *(line_start - 1) == '\n'){
+            *(line_start - 1) = '\0';
+        } else {
+            *line_start = '\0';
+        }
+    }
+    
+    printf("\n✓ 已刪除第 %d 行\n", line_to_delete);
+    printf("按任意鍵繼續...");
+    read_key();
+    return 1;  // 刪除成功
+}
+
 void edit_line(char *buffer, int current_line){
     // 找到要編輯的行
     char *line_ptr = buffer;
@@ -314,6 +365,7 @@ int main(int argc,char **argv){
     printf("  ↑/↓   - 上下移動選擇行\n");
     printf("  Enter - 進入編輯模式\n");
     printf("  n     - 在當前行之後新增一行\n");
+    printf("  d     - 刪除當前行\n");
     printf("  q     - 退出編輯器\n\n");
     printf("編輯模式功能：\n");
     printf("  ←/→      - 左右移動光標\n");
@@ -337,7 +389,7 @@ int main(int argc,char **argv){
         // 顯示提示信息
         printf("\n");
         printf("當前選擇：第 %d 行 (共 %d 行)\n", current_line, total_lines);
-        printf("操作：[↑↓] 移動  [Enter] 編輯  [n] 新增行  [q] 退出\n");
+        printf("操作：[↑↓] 移動  [Enter] 編輯  [n] 新增行  [d] 刪除行  [q] 退出\n");
         
         // 讀取按鍵
         char key = read_key();
@@ -394,6 +446,40 @@ int main(int argc,char **argv){
             // 調整視窗位置
             if(current_line >= row_offset + VISIBLE_LINES){
                 row_offset = current_line - VISIBLE_LINES + 1;
+            }
+        }
+        else if(key == 'd' || key == 'D'){
+            // 刪除當前行
+            clear_screen();
+            print_with_line_numbers(buffer, current_line, row_offset, total_lines);
+            
+            // 嘗試刪除當前行
+            int deleted = delete_line(buffer, current_line);
+            
+            if(deleted){
+                // 自動保存
+                file = fopen(filename, "w");
+                fwrite(buffer, strlen(buffer), 1, file);
+                fclose(file);
+                
+                // 重新計算行數
+                total_lines = count_lines(buffer);
+                
+                // 調整當前行位置
+                if(current_line > total_lines){
+                    current_line = total_lines;
+                }
+                if(current_line < 1){
+                    current_line = 1;
+                }
+                
+                // 調整視窗位置
+                if(current_line < row_offset){
+                    row_offset = current_line;
+                }
+                if(current_line >= row_offset + VISIBLE_LINES){
+                    row_offset = current_line - VISIBLE_LINES + 1;
+                }
             }
         }
         else if(key == 'L' || key == 'R'){
