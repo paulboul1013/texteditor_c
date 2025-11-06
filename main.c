@@ -8,6 +8,10 @@ struct termios orig_termios;
 
 #define VISIBLE_LINES 15  // 一次顯示的行數
 
+// 剪貼板緩衝區（用於複製貼上）
+char clipboard[512] = {0};
+int clipboard_has_content = 0;  // 標記剪貼板是否有內容
+
 // 恢復終端設定
 void disable_raw_mode() {
     tcsetattr(STDIN_FILENO, TCSAFLUSH, &orig_termios);
@@ -219,6 +223,87 @@ int delete_line(char *buffer, int line_to_delete){
     return 1;  // 刪除成功
 }
 
+// 複製指定行到剪貼板
+void copy_line(char *buffer, int line_to_copy){
+    // 找到要複製的行的起始位置
+    char *line_start = buffer;
+    for(int i = 0; i < line_to_copy - 1; i++){
+        char *next = strchr(line_start, '\n');
+        if(next){
+            line_start = next + 1;
+        } else {
+            printf("\n✗ 錯誤：找不到指定行\n");
+            printf("按任意鍵繼續...");
+            read_key();
+            return;
+        }
+    }
+    
+    // 找到行的結束位置
+    char *line_end = strchr(line_start, '\n');
+    int line_length;
+    
+    if(line_end){
+        line_length = line_end - line_start;
+    } else {
+        line_length = strlen(line_start);
+    }
+    
+    // 複製到剪貼板（不包括換行符）
+    if(line_length >= 512){
+        line_length = 511;  // 防止緩衝區溢出
+    }
+    
+    strncpy(clipboard, line_start, line_length);
+    clipboard[line_length] = '\0';
+    clipboard_has_content = 1;
+    
+    printf("\n✓ 已複製第 %d 行到剪貼板\n", line_to_copy);
+    printf("內容：%s\n", clipboard);
+    printf("按任意鍵繼續...");
+    read_key();
+}
+
+// 將剪貼板內容貼上到指定行之後
+void paste_line(char *buffer, int after_line){
+    if(!clipboard_has_content){
+        printf("\n✗ 剪貼板為空，請先複製內容\n");
+        printf("按任意鍵繼續...");
+        read_key();
+        return;
+    }
+    
+    // 找到插入位置（在指定行之後）
+    char *insert_pos = buffer;
+    
+    if(after_line > 0){
+        for(int i = 0; i < after_line; i++){
+            char *next = strchr(insert_pos, '\n');
+            if(next){
+                insert_pos = next + 1;
+            } else {
+                // 如果到了文件末尾但沒有換行符，先添加一個
+                insert_pos = buffer + strlen(buffer);
+                break;
+            }
+        }
+    }
+    
+    // 保存插入位置之後的內容
+    char after_content[512] = {0};
+    strcpy(after_content, insert_pos);
+    
+    // 在插入位置添加剪貼板內容和換行符
+    strcpy(insert_pos, clipboard);
+    strcpy(insert_pos + strlen(clipboard), "\n");
+    strcpy(insert_pos + strlen(clipboard) + 1, after_content);
+    
+    printf("\n✓ 已在第 %d 行之後貼上內容\n", after_line);
+    printf("內容：%s\n", clipboard);
+    printf("按任意鍵繼續...");
+    read_key();
+}
+
 void edit_line(char *buffer, int current_line){
     // 找到要編輯的行
     char *line_ptr = buffer;
@@ -372,6 +457,8 @@ int main(int argc,char **argv){
     printf("  Enter - 進入編輯模式\n");
     printf("  n     - 在當前行之後新增一行\n");
     printf("  d     - 刪除當前行\n");
+    printf("  c     - 複製當前行\n");
+    printf("  p     - 貼上複製的內容\n");
     printf("  q     - 退出編輯器\n\n");
     printf("編輯模式功能：\n");
     printf("  ←/→      - 左右移動光標\n");
@@ -394,8 +481,10 @@ int main(int argc,char **argv){
         
         // 顯示提示信息
         printf("\n");
-        printf("當前選擇：第 %d 行 (共 %d 行)\n", current_line, total_lines);
-        printf("操作：[↑↓] 移動  [Enter] 編輯  [n] 新增行  [d] 刪除行  [q] 退出\n");
+        printf("當前選擇：第 %d 行 (共 %d 行)%s\n", 
+               current_line, total_lines, 
+               clipboard_has_content ? "  [剪貼板: ✓]" : "");
+        printf("操作：[↑↓] 移動  [Enter] 編輯  [n] 新增  [d] 刪除  [c] 複製  [p] 貼上  [q] 退出\n");
         
         // 讀取按鍵
         char key = read_key();
@@ -483,6 +572,40 @@ int main(int argc,char **argv){
                 if(current_line < row_offset){
                     row_offset = current_line;
                 }
+                if(current_line >= row_offset + VISIBLE_LINES){
+                    row_offset = current_line - VISIBLE_LINES + 1;
+                }
+            }
+        }
+        else if(key == 'c' || key == 'C'){
+            // 複製當前行
+            clear_screen();
+            print_with_line_numbers(buffer, current_line, row_offset, total_lines);
+            
+            copy_line(buffer, current_line);
+        }
+        else if(key == 'p' || key == 'P'){
+            // 貼上複製的內容到當前行之後
+            clear_screen();
+            print_with_line_numbers(buffer, current_line, row_offset, total_lines);
+            
+            paste_line(buffer, current_line);
+            
+            // 自動保存
+            file = fopen(filename, "w");
+            fwrite(buffer, strlen(buffer), 1, file);
+            fclose(file);
+            
+            // 重新計算行數
+            total_lines = count_lines(buffer);
+            
+            // 移動到新貼上的行
+            if(clipboard_has_content){
+                current_line++;
+                if(current_line > total_lines){
+                    current_line = total_lines;
+                }
+                // 調整視窗位置
                 if(current_line >= row_offset + VISIBLE_LINES){
                     row_offset = current_line - VISIBLE_LINES + 1;
                 }
