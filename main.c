@@ -26,6 +26,12 @@ void enable_raw_mode() {
     tcsetattr(STDIN_FILENO, TCSAFLUSH, &raw);
 }
 
+// 方向鍵的內部表示（使用不可打印的控制字符避免衝突）
+#define KEY_UP    1
+#define KEY_DOWN  2
+#define KEY_RIGHT 3
+#define KEY_LEFT  4
+
 // 讀取按鍵
 char read_key() {
     char c;
@@ -38,10 +44,10 @@ char read_key() {
         if (read(STDIN_FILENO, &seq[1], 1) != 1) return c;
         
         if (seq[0] == '[') {
-            if (seq[1] == 'A') return 'U'; // Up arrow
-            if (seq[1] == 'B') return 'D'; // Down arrow
-            if (seq[1] == 'C') return 'R'; // Right arrow
-            if (seq[1] == 'D') return 'L'; // Left arrow
+            if (seq[1] == 'A') return KEY_UP;      // Up arrow
+            if (seq[1] == 'B') return KEY_DOWN;    // Down arrow
+            if (seq[1] == 'C') return KEY_RIGHT;   // Right arrow
+            if (seq[1] == 'D') return KEY_LEFT;    // Left arrow
         }
     }
     
@@ -297,13 +303,13 @@ void edit_line(char *buffer, int current_line){
             read_key();
             break;
         }
-        else if(key == 'L'){
+        else if(key == KEY_LEFT){
             // 左移光標
             if(cursor_pos > 0){
                 cursor_pos--;
             }
         }
-        else if(key == 'R'){
+        else if(key == KEY_RIGHT){
             // 右移光標
             if(cursor_pos < content_len){
                 cursor_pos++;
@@ -401,7 +407,7 @@ int main(int argc,char **argv){
             printf("\n正在退出編輯器...\n");
             break;
         }
-        else if(key == 'U'){
+        else if(key == KEY_UP){
             // 上移
             if(current_line > 1){
                 current_line--;
@@ -411,7 +417,7 @@ int main(int argc,char **argv){
                 }
             }
         }
-        else if(key == 'D'){
+        else if(key == KEY_DOWN){
             // 下移
             if(current_line < total_lines){
                 current_line++;
@@ -482,8 +488,8 @@ int main(int argc,char **argv){
                 }
             }
         }
-        else if(key == 'L' || key == 'R'){
-            // 左右鍵在主選單中不執行任何操作（僅在編輯模式中使用）
+        else if(key == KEY_LEFT || key == KEY_RIGHT){
+            // 左右方向鍵在主選單中不執行任何操作（僅在編輯模式中使用）
             // 忽略這些按鍵，避免未處理的輸入
         }
         else if(key == '\r' || key == '\n'){
