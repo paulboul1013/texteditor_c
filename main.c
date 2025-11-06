@@ -505,7 +505,7 @@ void enter_search_mode(char *buffer, int current_line, int row_offset, int total
     enable_raw_mode();
 }
 
-void edit_line(char *buffer, int current_line){
+void edit_line(char *buffer, int current_line, int row_offset, int total_lines){
     // 找到要編輯的行
     char *line_ptr = buffer;
     for (int i = 0; i < current_line - 1; i++){
@@ -535,15 +535,15 @@ void edit_line(char *buffer, int current_line){
         clear_screen();
         printf("╔═══════════════════════════════════════════╗\n");
         printf("║       編輯模式 - 行 %d                    ║\n", current_line);
-        printf("╚═══════════════════════════════════════════╝\n\n");
-        printf("操作說明：\n");
-        printf("  ←/→      - 左右移動光標\n");
-        printf("  Backspace - 刪除光標前的字符\n");
-        printf("  任意字符  - 在光標位置插入\n");
-        printf("  Enter    - 完成編輯\n");
-        printf("  ESC      - 取消編輯\n\n");
+        printf("╚═══════════════════════════════════════════╝\n");
         
-        printf("編輯內容：\n");
+        // 顯示文本內容讓用戶參考
+        print_with_line_numbers(buffer, current_line, row_offset, total_lines);
+        
+        printf("\n");
+        printf("操作說明：[←/→] 移動光標  [Backspace] 刪除  [Enter] 完成  [ESC] 取消\n\n");
+        
+        printf("編輯第 %d 行：\n", current_line);
         printf("┌─────────────────────────────────────────┐\n");
         printf("│ ");
         
@@ -564,7 +564,6 @@ void edit_line(char *buffer, int current_line){
         }
         
         printf("\n└─────────────────────────────────────────┘\n");
-        // printf("\n光標位置：%d/%d\n", cursor_pos, content_len);
         
         // 讀取按鍵
         char key = read_key();
@@ -889,10 +888,7 @@ int main(int argc,char **argv){
         }
         else if(key == '\r' || key == '\n'){
             // Enter - 編輯當前行
-            clear_screen();
-            print_with_line_numbers(buffer, current_line, row_offset, total_lines);
-            
-            edit_line(buffer, current_line);
+            edit_line(buffer, current_line, row_offset, total_lines);
             
             // 自動保存
             file = fopen(filename, "w");
