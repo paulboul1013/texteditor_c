@@ -12,6 +12,14 @@ struct termios orig_termios;
 char clipboard[512] = {0};
 int clipboard_has_content = 0;  // 標記剪貼板是否有內容
 
+// 搜尋相關變數
+char search_term[128] = {0};     // 搜尋字串
+int search_mode = 0;              // 是否在搜尋模式中
+int search_result_line = 0;       // 當前匹配結果所在的行號
+int search_result_offset = 0;     // 當前匹配在行內的偏移量
+int total_matches = 0;            // 總匹配數
+int current_match = 0;            // 當前是第幾個匹配
+
 // 恢復終端設定
 void disable_raw_mode() {
     tcsetattr(STDIN_FILENO, TCSAFLUSH, &orig_termios);
@@ -44,15 +52,40 @@ char read_key() {
     // 檢測方向鍵（ESC序列）
     if (c == '\033') {
         char seq[3];
-        if (read(STDIN_FILENO, &seq[0], 1) != 1) return c;
-        if (read(STDIN_FILENO, &seq[1], 1) != 1) return c;
         
-        if (seq[0] == '[') {
+        // 使用非阻塞模式來判斷是否有後續字符
+        struct termios old_term;
+        tcgetattr(STDIN_FILENO, &old_term);
+        
+        struct termios new_term = old_term;
+        new_term.c_cc[VMIN] = 0;   // 非阻塞
+        new_term.c_cc[VTIME] = 1;  // 0.1 秒超時
+        tcsetattr(STDIN_FILENO, TCSANOW, &new_term);
+        
+        int nread1 = read(STDIN_FILENO, &seq[0], 1);
+        int nread2 = 0;
+        if (nread1 == 1) {
+            nread2 = read(STDIN_FILENO, &seq[1], 1);
+        }
+        
+        // 恢復原始設定
+        tcsetattr(STDIN_FILENO, TCSANOW, &old_term);
+        
+        // 如果沒有後續字符，這是單純的 ESC
+        if (nread1 == 0) {
+            return c;  // 返回 ESC
+        }
+        
+        // 檢查是否是方向鍵序列
+        if (nread2 == 1 && seq[0] == '[') {
             if (seq[1] == 'A') return KEY_UP;      // Up arrow
             if (seq[1] == 'B') return KEY_DOWN;    // Down arrow
             if (seq[1] == 'C') return KEY_RIGHT;   // Right arrow
             if (seq[1] == 'D') return KEY_LEFT;    // Left arrow
         }
+        
+        // 不是方向鍵，返回 ESC
+        return c;
     }
     
     return c;
@@ -120,10 +153,52 @@ void print_with_line_numbers(char *buffer, int highlight_line, int row_offset, i
         // 如果是要編輯的行，用特殊標記顯示
         if(line_num == highlight_line){
             printf("\033[1;32m>>> [行 %d] ", line_num);  // 綠色加粗
+        } else {
+            printf("    [行 %d] ", line_num);
+        }
+        
+        // 如果在搜尋模式且這行有匹配，高亮顯示搜尋詞
+        if(search_mode && strlen(search_term) > 0) {
+            char line_content[512];
+            int copy_len = (line_length < 511) ? line_length : 511;
+            strncpy(line_content, line_start, copy_len);
+            line_content[copy_len] = '\0';
+            
+            char *match_pos = line_content;
+            char *last_pos = line_content;
+            int printed = 0;
+            
+            while((match_pos = strstr(match_pos, search_term)) != NULL) {
+                // 打印匹配前的部分
+                printf("%.*s", (int)(match_pos - last_pos), last_pos);
+                // 高亮打印匹配的部分
+                if(line_num == search_result_line && 
+                   (match_pos - line_content) == search_result_offset) {
+                    printf("\033[1;33;7m%.*s\033[0m", (int)strlen(search_term), match_pos);  // 黃色反色（當前匹配）
+                } else {
+                    printf("\033[1;33m%.*s\033[0m", (int)strlen(search_term), match_pos);  // 黃色（其他匹配）
+                }
+                match_pos += strlen(search_term);
+                last_pos = match_pos;
+                printed = 1;
+            }
+            
+            if(printed) {
+                // 打印剩餘的部分
+                printf("%s", last_pos);
+            } else {
+                // 沒有匹配，正常打印
+                printf("%.*s", line_length, line_start);
+            }
+        } else {
+            // 正常打印
             printf("%.*s", line_length, line_start);
+        }
+        
+        if(line_num == highlight_line){
             printf(" <<<\033[0m\n");  // 重置顏色
         } else {
-            printf("    [行 %d] %.*s\n", line_num, line_length, line_start);
+            printf("\n");
         }
         
         if(!line_end) break;
@@ -304,6 +379,132 @@ void paste_line(char *buffer, int after_line){
     read_key();
 }
 
+// 計算總共有多少個匹配
+int count_matches(char *buffer, const char *search_term) {
+    if(strlen(search_term) == 0) return 0;
+    
+    int count = 0;
+    char *ptr = buffer;
+    
+    while((ptr = strstr(ptr, search_term)) != NULL) {
+        count++;
+        ptr += strlen(search_term);
+    }
+    
+    return count;
+}
+
+// 搜尋指定字串，從指定位置開始
+// 返回值：1=找到，0=未找到
+int search_forward(char *buffer, const char *search_term, int start_line, int start_offset,
+                  int *result_line, int *result_offset) {
+    if(strlen(search_term) == 0) return 0;
+    
+    char *line_start = buffer;
+    int current_line = 1;
+    
+    // 移動到起始行
+    while(current_line < start_line && *line_start) {
+        char *next = strchr(line_start, '\n');
+        if(!next) break;
+        line_start = next + 1;
+        current_line++;
+    }
+    
+    // 從起始偏移量開始搜尋
+    char *search_start = line_start + start_offset;
+    char *found = strstr(search_start, search_term);
+    
+    // 如果在當前行沒找到，繼續搜尋後面的行
+    if(!found || (strchr(search_start, '\n') && found > strchr(search_start, '\n'))) {
+        // 移到下一行
+        char *next_line = strchr(line_start, '\n');
+        if(next_line) {
+            line_start = next_line + 1;
+            current_line++;
+            
+            // 搜尋剩餘的行
+            while(*line_start) {
+                found = strstr(line_start, search_term);
+                char *line_end = strchr(line_start, '\n');
+                
+                if(found && (!line_end || found < line_end)) {
+                    *result_line = current_line;
+                    *result_offset = found - line_start;
+                    return 1;
+                }
+                
+                if(!line_end) break;
+                line_start = line_end + 1;
+                current_line++;
+            }
+        }
+    } else {
+        // 在當前行找到
+        *result_line = current_line;
+        *result_offset = found - line_start;
+        return 1;
+    }
+    
+    // 沒找到，從頭開始循環搜尋
+    line_start = buffer;
+    current_line = 1;
+    
+    while(current_line < start_line) {
+        found = strstr(line_start, search_term);
+        char *line_end = strchr(line_start, '\n');
+        
+        if(found && (!line_end || found < line_end)) {
+            *result_line = current_line;
+            *result_offset = found - line_start;
+            return 1;
+        }
+        
+        if(!line_end) break;
+        line_start = line_end + 1;
+        current_line++;
+    }
+    
+    return 0;  // 完全沒找到
+}
+
+// 進入搜尋模式，讓用戶輸入搜尋字串（顯示文本內容）
+void enter_search_mode(char *buffer, int current_line, int row_offset, int total_lines) {
+    clear_screen();
+    
+    printf("╔═══════════════════════════════════════════╗\n");
+    printf("║              搜尋模式                     ║\n");
+    printf("╚═══════════════════════════════════════════╝\n");
+    
+    // 顯示當前文本內容，讓用戶參考
+    print_with_line_numbers(buffer, current_line, row_offset, total_lines);
+    
+    printf("\n");
+    printf("┌─────────────────────────────────────────┐\n");
+    printf("│ 請輸入要搜尋的字串：");
+    
+    // 臨時禁用原始模式以便讀取一行文字
+    disable_raw_mode();
+    
+    if(fgets(search_term, sizeof(search_term), stdin) != NULL) {
+        // 移除換行符
+        size_t len = strlen(search_term);
+        if(len > 0 && search_term[len-1] == '\n') {
+            search_term[len-1] = '\0';
+        }
+        
+        if(strlen(search_term) > 0) {
+            search_mode = 1;
+            current_match = 0;
+        }
+    }
+    
+    printf("└─────────────────────────────────────────┘\n");
+    
+    // 重新啟用原始模式
+    enable_raw_mode();
+}
+
 void edit_line(char *buffer, int current_line){
     // 找到要編輯的行
     char *line_ptr = buffer;
@@ -453,13 +654,14 @@ int main(int argc,char **argv){
     printf("║       文本編輯器 - 鍵盤導航模式          ║\n");
     printf("╚═══════════════════════════════════════════╝\n\n");
     printf("操作說明：\n");
-    printf("  ↑/↓   - 上下移動選擇行\n");
-    printf("  Enter - 進入編輯模式\n");
-    printf("  n     - 在當前行之後新增一行\n");
-    printf("  d     - 刪除當前行\n");
-    printf("  c     - 複製當前行\n");
-    printf("  p     - 貼上複製的內容\n");
-    printf("  q     - 退出編輯器\n\n");
+    printf("  ↑/↓     - 上下移動選擇行\n");
+    printf("  Enter   - 進入編輯模式\n");
+    printf("  f       - 搜尋字串\n");
+    printf("  n       - 在當前行之後新增一行 / 搜尋模式下跳到下一個匹配\n");
+    printf("  d       - 刪除當前行\n");
+    printf("  c       - 複製當前行\n");
+    printf("  p       - 貼上複製的內容\n");
+    printf("  q       - 退出編輯器\n\n");
     printf("編輯模式功能：\n");
     printf("  ←/→      - 左右移動光標\n");
     printf("  字符輸入  - 在光標位置插入\n");
@@ -481,15 +683,66 @@ int main(int argc,char **argv){
         
         // 顯示提示信息
         printf("\n");
-        printf("當前選擇：第 %d 行 (共 %d 行)%s\n", 
+        printf("當前選擇：第 %d 行 (共 %d 行)%s%s\n", 
                current_line, total_lines, 
-               clipboard_has_content ? "  [剪貼板: ✓]" : "");
-        printf("操作：[↑↓] 移動  [Enter] 編輯  [n] 新增  [d] 刪除  [c] 複製  [p] 貼上  [q] 退出\n");
+               clipboard_has_content ? "  [剪貼板: ✓]" : "",
+               search_mode ? "  [搜尋: " : "");
+        if(search_mode) {
+            printf("%s] (%d/%d)", search_term, current_match, total_matches);
+        }
+        printf("\n");
+        if(search_mode) {
+            printf("操作：[n] 下一個匹配  [ESC] 退出搜尋  [↑↓] 移動  [Enter] 編輯  [q] 退出\n");
+        } else {
+            printf("操作：[f] 搜尋  [↑↓] 移動  [Enter] 編輯  [n] 新增  [d] 刪除  [c] 複製  [p] 貼上  [q] 退出\n");
+        }
         
         // 讀取按鍵
         char key = read_key();
         
-        if(key == 'q' || key == 'Q'){
+        if(key == 'f' || key == 'F'){  // F 鍵
+            // 進入搜尋模式（顯示當前文本內容）
+            enter_search_mode(buffer, current_line, row_offset, total_lines);
+            
+            if(search_mode && strlen(search_term) > 0) {
+                // 計算總匹配數
+                total_matches = count_matches(buffer, search_term);
+                
+                if(total_matches > 0) {
+                    // 從當前位置開始搜尋第一個匹配
+                    if(search_forward(buffer, search_term, current_line, 0,
+                                    &search_result_line, &search_result_offset)) {
+                        current_line = search_result_line;
+                        current_match = 1;
+                        
+                        // 調整視窗位置
+                        if(current_line < row_offset) {
+                            row_offset = current_line;
+                        } else if(current_line >= row_offset + VISIBLE_LINES) {
+                            row_offset = current_line - VISIBLE_LINES + 1;
+                        }
+                    }
+                } else {
+                    search_mode = 0;
+                    clear_screen();
+                    printf("\n✗ 未找到匹配的結果\n");
+                    printf("按任意鍵繼續...");
+                    read_key();
+                }
+            }
+        }
+        else if(key == '\033'){  // ESC 鍵
+            if(search_mode){
+                // 退出搜尋模式
+                search_mode = 0;
+                search_term[0] = '\0';
+                total_matches = 0;
+                current_match = 0;
+                search_result_line = 0;
+                search_result_offset = 0;
+            }
+        }
+        else if(key == 'q' || key == 'Q'){
             // 退出
             clear_screen();
             disable_raw_mode();
@@ -517,30 +770,49 @@ int main(int argc,char **argv){
             }
         }
         else if(key == 'n' || key == 'N'){
-            // 在當前行之後新增一行
-            clear_screen();
+            if(search_mode && strlen(search_term) > 0) {
+                // 搜尋模式：跳到下一個匹配
+                int next_offset = search_result_offset + strlen(search_term);
+                
+                if(search_forward(buffer, search_term, search_result_line, next_offset,
+                                &search_result_line, &search_result_offset)) {
+                    current_line = search_result_line;
+                    current_match++;
+                    if(current_match > total_matches) {
+                        current_match = 1;  // 循環回第一個
+                    }
+                    
+                    // 調整視窗位置
+                    if(current_line < row_offset) {
+                        row_offset = current_line;
+                    } else if(current_line >= row_offset + VISIBLE_LINES) {
+                        row_offset = current_line - VISIBLE_LINES + 1;
+                    }
+                }
+            } else {
+                // 非搜尋模式：在當前行之後新增一行
+                clear_screen();
+                print_with_line_numbers(buffer, current_line, row_offset, total_lines);
 
+                insert_new_line(buffer, current_line);
+                
+                // 自動保存
+                file = fopen(filename, "w");
+                fwrite(buffer, strlen(buffer), 1, file);
+                fclose(file);
+                
+                // 重新計算行數
+                total_lines = count_lines(buffer);
 
-            print_with_line_numbers(buffer, current_line, row_offset, total_lines);
-
-            insert_new_line(buffer, current_line);
-            
-            // 自動保存
-            file = fopen(filename, "w");
-            fwrite(buffer, strlen(buffer), 1, file);
-            fclose(file);
-            
-            // 重新計算行數
-            total_lines = count_lines(buffer);
-
-            // 移動到新插入的行
-            current_line++;
-            if(current_line > total_lines){
-                current_line = total_lines;
-            }
-            // 調整視窗位置
-            if(current_line >= row_offset + VISIBLE_LINES){
-                row_offset = current_line - VISIBLE_LINES + 1;
+                // 移動到新插入的行
+                current_line++;
+                if(current_line > total_lines){
+                    current_line = total_lines;
+                }
+                // 調整視窗位置
+                if(current_line >= row_offset + VISIBLE_LINES){
+                    row_offset = current_line - VISIBLE_LINES + 1;
+                }
             }
         }
         else if(key == 'd' || key == 'D'){
