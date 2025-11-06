@@ -6,6 +6,8 @@
 
 struct termios orig_termios;
 
+#define VISIBLE_LINES 15  // 一次顯示的行數
+
 // 恢復終端設定
 void disable_raw_mode() {
     tcsetattr(STDIN_FILENO, TCSAFLUSH, &orig_termios);
@@ -75,14 +77,27 @@ void clear_screen() {
     write(STDOUT_FILENO, "\033[H", 3);
 }
 
-// 顯示內容時帶行號
-void print_with_line_numbers(char *buffer, int highlight_line){
+// 顯示內容時帶行號（支援視窗滾動）
+void print_with_line_numbers(char *buffer, int highlight_line, int row_offset, int total_lines){
     char *line_start = buffer;
     char *line_end;
     int line_num = 1;
     
-    printf("\n========== 文件內容 ==========\n");
-    while(*line_start){
+    // 先移動到起始行
+    while(line_num < row_offset && *line_start){
+        line_end = strchr(line_start, '\n');
+        if(!line_end) break;
+        line_start = line_end + 1;
+        line_num++;
+    }
+    
+    printf("\n========== 文件內容 (顯示 %d-%d 行，共 %d 行) ==========\n", 
+           row_offset, 
+           (row_offset + VISIBLE_LINES - 1 > total_lines) ? total_lines : row_offset + VISIBLE_LINES - 1,
+           total_lines);
+    
+    int displayed_lines = 0;
+    while(*line_start && displayed_lines < VISIBLE_LINES){
         line_end = strchr(line_start, '\n');
         int line_length;
         
@@ -104,8 +119,16 @@ void print_with_line_numbers(char *buffer, int highlight_line){
         if(!line_end) break;
         line_start = line_end + 1;
         line_num++;
+        displayed_lines++;
     }
-    printf("==============================\n\n");
+    
+    // 如果顯示的行數不足，填充空白
+    while(displayed_lines < VISIBLE_LINES){
+        printf("\n");
+        displayed_lines++;
+    }
+    
+    printf("====================================================\n\n");
 }
 
 // 在指定行之後插入新行
@@ -278,6 +301,7 @@ int main(int argc,char **argv){
     }
     
     int current_line = 1;  // 當前選中的行
+    int row_offset = 1;        // 視窗頂部的行號
     
     // 啟用原始模式來讀取方向鍵
     enable_raw_mode();
@@ -308,7 +332,7 @@ int main(int argc,char **argv){
         printf("╚═══════════════════════════════════════════╝\n");
         
         // 顯示文件內容，高亮當前行
-        print_with_line_numbers(buffer, current_line);
+        print_with_line_numbers(buffer, current_line, row_offset, total_lines);
         
         // 顯示提示信息
         printf("\n");
@@ -329,19 +353,29 @@ int main(int argc,char **argv){
             // 上移
             if(current_line > 1){
                 current_line--;
+                // 如果當前行移出視窗頂部，調整視窗
+                if(current_line < row_offset){
+                    row_offset = current_line;
+                }
             }
         }
         else if(key == 'D'){
             // 下移
             if(current_line < total_lines){
                 current_line++;
+                // 如果當前行移出視窗底部，調整視窗
+                if(current_line >= row_offset + VISIBLE_LINES){
+                    row_offset = current_line - VISIBLE_LINES + 1;
+                }
             }
         }
         else if(key == 'n' || key == 'N'){
             // 在當前行之後新增一行
             clear_screen();
-            print_with_line_numbers(buffer, current_line);
-            
+
+
+            print_with_line_numbers(buffer, current_line, row_offset, total_lines);
+
             insert_new_line(buffer, current_line);
             
             // 自動保存
@@ -351,10 +385,15 @@ int main(int argc,char **argv){
             
             // 重新計算行數
             total_lines = count_lines(buffer);
+
             // 移動到新插入的行
             current_line++;
             if(current_line > total_lines){
                 current_line = total_lines;
+            }
+            // 調整視窗位置
+            if(current_line >= row_offset + VISIBLE_LINES){
+                row_offset = current_line - VISIBLE_LINES + 1;
             }
         }
         else if(key == 'L' || key == 'R'){
@@ -364,7 +403,7 @@ int main(int argc,char **argv){
         else if(key == '\r' || key == '\n'){
             // Enter - 編輯當前行
             clear_screen();
-            print_with_line_numbers(buffer, current_line);
+            print_with_line_numbers(buffer, current_line, row_offset, total_lines);
             
             edit_line(buffer, current_line);
             
