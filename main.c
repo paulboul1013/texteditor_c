@@ -3,6 +3,12 @@
 #include <unistd.h>
 #include <termios.h>
 #include <string.h>
+#include <sys/types.h>
+#include <sys/socket.h>
+#include <netinet/in.h>
+#include <arpa/inet.h>
+#include <pthread.h>
+#include <errno.h>
 
 struct termios orig_termios;
 
@@ -31,6 +37,559 @@ typedef struct {
 EditorState editors[2];  // 最多兩個編輯器
 int num_editors = 0;     // 實際編輯器數量（1或2）
 int active_editor = 0;   // 當前活動的編輯器（0或1）
+
+// 函式前置宣告
+int count_lines(char *buffer);
+
+// ===== Live Share（即時共同編輯）相關 =====
+enum {
+	LIVE_NONE = 0,
+	LIVE_HOST = 1,
+	LIVE_JOIN = 2
+};
+
+enum LiveOpType {
+	OP_SYNC_FULL = 1,
+	OP_EDIT_LINE = 2,
+	OP_INSERT_AFTER = 3,
+	OP_DELETE_LINE = 4,
+	OP_PASTE_AFTER = 5,
+	OP_CURSOR = 6,
+	OP_HELLO = 7
+};
+
+static int live_mode = LIVE_NONE;       // 0: 關閉, 1: 主機, 2: 加入
+static int live_server_sock = -1;       // 僅主機使用，用於 listen
+static int live_sock = -1;              // 已連線的對等端
+static volatile int live_running = 0;   // 收發執行緒運行旗標
+static pthread_t live_thread;
+static pthread_mutex_t editor_mutex[2] = { PTHREAD_MUTEX_INITIALIZER, PTHREAD_MUTEX_INITIALIZER };
+static volatile int live_remote_line = 0; // 已廢棄（保留避免破壞原行為）
+
+#define MAX_PEERS 20
+static int live_self_id = 1; // host 為 1；client 由主機指定
+static int live_peer_line[MAX_PEERS + 1] = {0}; // 1..MAX_PEERS 的每位參與者所在行
+
+// Host 端多連線管理
+typedef struct {
+	int fd;
+	int id;
+	int in_use;
+	pthread_t thread;
+} ClientInfo;
+
+static ClientInfo live_clients[MAX_PEERS] = {0};
+static pthread_mutex_t live_clients_mutex = PTHREAD_MUTEX_INITIALIZER;
+static int next_assign_id = 2;
+
+static void live_lock_editor(int idx) {
+	if (idx >= 0 && idx < 2) {
+		pthread_mutex_lock(&editor_mutex[idx]);
+	}
+}
+static void live_unlock_editor(int idx) {
+	if (idx >= 0 && idx < 2) {
+		pthread_mutex_unlock(&editor_mutex[idx]);
+	}
+}
+
+static int send_all(int sock, const void *buf, size_t len) {
+	const char *p = (const char *)buf;
+	size_t left = len;
+	while (left > 0) {
+		ssize_t n = send(sock, p, left, 0);
+		if (n <= 0) {
+			if (errno == EINTR) continue;
+			return -1;
+		}
+		p += n;
+		left -= (size_t)n;
+	}
+	return 0;
+}
+
+static int recv_line(int sock, char *buf, size_t max) {
+	size_t i = 0;
+	while (i + 1 < max) {
+		char c;
+		ssize_t n = recv(sock, &c, 1, 0);
+		if (n <= 0) return -1;
+		buf[i++] = c;
+		if (c == '\n') break;
+	}
+	buf[i] = '\0';
+	return (int)i;
+}
+
+static int recv_all(int sock, void *buf, size_t len) {
+	char *p = (char *)buf;
+	size_t left = len;
+	while (left > 0) {
+		ssize_t n = recv(sock, p, left, 0);
+		if (n <= 0) {
+			if (errno == EINTR) continue;
+			return -1;
+		}
+		p += n;
+		left -= (size_t)n;
+	}
+	return 0;
+}
+
+static void send_header_payload_to_fd(int fd, const char *header, size_t hlen, const char *payload, size_t plen) {
+	if (fd < 0) return;
+	if (send_all(fd, header, hlen) != 0) return;
+	if (plen > 0 && payload) {
+		send_all(fd, payload, plen);
+	}
+}
+
+static void broadcast_header_payload_except(int except_fd, const char *header, size_t hlen, const char *payload, size_t plen) {
+	pthread_mutex_lock(&live_clients_mutex);
+	for (int i = 0; i < MAX_PEERS; i++) {
+		if (live_clients[i].in_use && live_clients[i].fd >= 0 && live_clients[i].fd != except_fd) {
+			send_header_payload_to_fd(live_clients[i].fd, header, hlen, payload, plen);
+		}
+	}
+	pthread_mutex_unlock(&live_clients_mutex);
+}
+
+static void live_broadcast_simple(enum LiveOpType t, int line) {
+	char header[128];
+	int header_len = snprintf(header, sizeof(header), "OP %d %d 0\n", (int)t, line);
+	if (header_len <= 0) return;
+	if (live_mode == LIVE_HOST) {
+		broadcast_header_payload_except(-1, header, (size_t)header_len, NULL, 0);
+	} else if (live_mode == LIVE_JOIN) {
+		if (live_sock >= 0) {
+			send_all(live_sock, header, (size_t)header_len);
+		}
+	}
+}
+
+static void live_broadcast_with_payload(enum LiveOpType t, int line, const char *payload) {
+	size_t plen = payload ? strlen(payload) : 0;
+	char header[128];
+	int header_len = snprintf(header, sizeof(header), "OP %d %d %zu\n", (int)t, line, plen);
+	if (header_len <= 0) return;
+	if (live_mode == LIVE_HOST) {
+		broadcast_header_payload_except(-1, header, (size_t)header_len, payload, plen);
+	} else if (live_mode == LIVE_JOIN) {
+		if (live_sock >= 0) {
+			if (send_all(live_sock, header, (size_t)header_len) != 0) return;
+			if (plen > 0) send_all(live_sock, payload, plen);
+		}
+	}
+}
+
+static void live_broadcast_cursor(int current_line) {
+	// 格式："id line"
+	char buf[64];
+	int n = snprintf(buf, sizeof(buf), "%d %d", live_self_id, current_line);
+	if (n <= 0) return;
+	live_broadcast_with_payload(OP_CURSOR, 0, buf);
+}
+
+static void editor_recount_and_clamp(EditorState *ed) {
+	ed->total_lines = count_lines(ed->buffer);
+	if (ed->total_lines < 1) ed->total_lines = 1;
+	if (ed->current_line < 1) ed->current_line = 1;
+	if (ed->current_line > ed->total_lines) ed->current_line = ed->total_lines;
+	if (ed->row_offset < 1) ed->row_offset = 1;
+	if (ed->current_line >= ed->row_offset + VISIBLE_LINES) {
+		ed->row_offset = ed->current_line - VISIBLE_LINES + 1;
+	}
+	if (ed->current_line < ed->row_offset) {
+		ed->row_offset = ed->current_line;
+	}
+}
+
+// 在指定行替換為新內容（不包含換行），保留行後剩餘內容
+static void replace_line_silent(char *buffer, int line_no, const char *new_content) {
+	if (line_no < 1) return;
+	char *line_start = buffer;
+	for (int i = 0; i < line_no - 1; i++) {
+		char *next = strchr(line_start, '\n');
+		if (!next) {
+			// 補到最後為止
+			line_start = buffer + strlen(buffer);
+			break;
+		}
+		line_start = next + 1;
+	}
+	char *line_end = strchr(line_start, '\n');
+	char after_line[512] = {0};
+	if (line_end) {
+		strcpy(after_line, line_end);
+	} else {
+		after_line[0] = '\0';
+	}
+	size_t new_len = new_content ? strlen(new_content) : 0;
+	// 將新內容寫入並接回後續
+	if (new_len > 0) {
+		strcpy(line_start, new_content);
+		strcpy(line_start + new_len, after_line);
+	} else {
+		// 清空此行
+		strcpy(line_start, after_line[0] ? after_line + 1 : "");
+	}
+}
+
+// 在 after_line 之後插入一行，內容為 payload（可為空）
+static void insert_after_silent(char *buffer, int after_line, const char *payload) {
+	char *insert_pos = buffer;
+	if (after_line > 0) {
+		for (int i = 0; i < after_line; i++) {
+			char *next = strchr(insert_pos, '\n');
+			if (next) {
+				insert_pos = next + 1;
+			} else {
+				insert_pos = buffer + strlen(buffer);
+				break;
+			}
+		}
+	}
+	char after_content[512] = {0};
+	strcpy(after_content, insert_pos);
+	const char *content = payload ? payload : "";
+	strcpy(insert_pos, content);
+	strcpy(insert_pos + strlen(content), "\n");
+	strcpy(insert_pos + strlen(content) + 1, after_content);
+}
+
+// 刪除此行（不做任何 UI 提示）
+static void delete_line_silent(char *buffer, int line_to_delete) {
+	int total = count_lines(buffer);
+	if (total <= 1) {
+		return;
+	}
+	char *line_start = buffer;
+	for (int i = 0; i < line_to_delete - 1; i++) {
+		char *next = strchr(line_start, '\n');
+		if (next) {
+			line_start = next + 1;
+		} else {
+			return;
+		}
+	}
+	char *line_end = strchr(line_start, '\n');
+	char after_content[512] = {0};
+	if (line_end) {
+		strcpy(after_content, line_end + 1);
+		strcpy(line_start, after_content);
+	} else {
+		if (line_start > buffer && *(line_start - 1) == '\n') {
+			*(line_start - 1) = '\0';
+		} else {
+			*line_start = '\0';
+		}
+	}
+}
+
+static void apply_remote_op(enum LiveOpType t, int line, const char *payload, size_t plen) {
+	// 目前僅同步第一個編輯器
+	EditorState *ed = &editors[0];
+	live_lock_editor(0);
+	if (t == OP_SYNC_FULL) {
+		size_t copy_len = (plen < sizeof(ed->buffer) - 1) ? plen : sizeof(ed->buffer) - 1;
+		memset(ed->buffer, 0, sizeof(ed->buffer));
+		if (copy_len > 0) {
+			memcpy(ed->buffer, payload, copy_len);
+			ed->buffer[copy_len] = '\0';
+		}
+		editor_recount_and_clamp(ed);
+	} else if (t == OP_EDIT_LINE) {
+		char tmp[512];
+		size_t copy_len = (plen < sizeof(tmp) - 1) ? plen : sizeof(tmp) - 1;
+		memcpy(tmp, payload, copy_len);
+		tmp[copy_len] = '\0';
+		replace_line_silent(ed->buffer, line, tmp);
+		editor_recount_and_clamp(ed);
+	} else if (t == OP_INSERT_AFTER) {
+		char tmp[512] = {0};
+		if (plen > 0) {
+			size_t copy_len = (plen < sizeof(tmp) - 1) ? plen : sizeof(tmp) - 1;
+			memcpy(tmp, payload, copy_len);
+			tmp[copy_len] = '\0';
+		}
+		insert_after_silent(ed->buffer, line, tmp);
+		editor_recount_and_clamp(ed);
+	} else if (t == OP_DELETE_LINE) {
+		delete_line_silent(ed->buffer, line);
+		editor_recount_and_clamp(ed);
+	} else if (t == OP_PASTE_AFTER) {
+		char tmp[512] = {0};
+		size_t copy_len = (plen < sizeof(tmp) - 1) ? plen : sizeof(tmp) - 1;
+		memcpy(tmp, payload, copy_len);
+		tmp[copy_len] = '\0';
+		insert_after_silent(ed->buffer, line, tmp);
+		editor_recount_and_clamp(ed);
+	} else if (t == OP_CURSOR) {
+		// payload: "id line"
+		int pid = 0, pline = 0;
+		if (payload && plen > 0) {
+			char tmp[64] = {0};
+			size_t copy_len = (plen < sizeof(tmp) - 1) ? plen : sizeof(tmp) - 1;
+			memcpy(tmp, payload, copy_len);
+			tmp[copy_len] = '\0';
+			sscanf(tmp, "%d %d", &pid, &pline);
+			if (pid >= 1 && pid <= MAX_PEERS && pid != live_self_id) {
+				live_peer_line[pid] = pline;
+			}
+		}
+	} else if (t == OP_HELLO) {
+		// 僅 client 端接收：設定 self id
+		if (payload && plen > 0 && live_mode == LIVE_JOIN) {
+			char tmp[32] = {0};
+			size_t copy_len = (plen < sizeof(tmp) - 1) ? plen : sizeof(tmp) - 1;
+			memcpy(tmp, payload, copy_len);
+			tmp[copy_len] = '\0';
+			int assigned = atoi(tmp);
+			if (assigned >= 1 && assigned <= MAX_PEERS) {
+				live_self_id = assigned;
+			}
+		}
+	}
+	live_unlock_editor(0);
+}
+
+// ===== Host 端：每個客戶端的接收線程 =====
+static void *host_client_thread(void *arg) {
+	int idx = *(int*)arg;
+	free(arg);
+	int cfd = -1;
+	int cid = 0;
+	{
+		pthread_mutex_lock(&live_clients_mutex);
+		if (idx >= 0 && idx < MAX_PEERS && live_clients[idx].in_use) {
+			cfd = live_clients[idx].fd;
+			cid = live_clients[idx].id;
+		}
+		pthread_mutex_unlock(&live_clients_mutex);
+	}
+	if (cfd < 0 || cid <= 0) return NULL;
+
+	// 發送 HELLO 與完整同步、目前已知的游標位置
+	{
+		char idbuf[32];
+		int idlen = snprintf(idbuf, sizeof(idbuf), "%d", cid);
+		char header[128];
+		int header_len = snprintf(header, sizeof(header), "OP %d 0 %d\n", (int)OP_HELLO, idlen);
+		send_header_payload_to_fd(cfd, header, (size_t)header_len, idbuf, (size_t)idlen);
+
+		// 發送完整內容
+		EditorState *ed = &editors[0];
+		size_t plen = strlen(ed->buffer);
+		header_len = snprintf(header, sizeof(header), "OP %d 0 %zu\n", (int)OP_SYNC_FULL, plen);
+		send_header_payload_to_fd(cfd, header, (size_t)header_len, ed->buffer, plen);
+
+		// 發送當前已知游標（包含主機自己與其他人）
+		for (int i = 1; i <= MAX_PEERS; i++) {
+			if (live_peer_line[i] > 0) {
+				char payload[64];
+				int n = snprintf(payload, sizeof(payload), "%d %d", i, live_peer_line[i]);
+				header_len = snprintf(header, sizeof(header), "OP %d 0 %d\n", (int)OP_CURSOR, n);
+				send_header_payload_to_fd(cfd, header, (size_t)header_len, payload, (size_t)n);
+			}
+		}
+	}
+
+	// 接收循環
+	while (live_running) {
+		char header[128];
+		if (recv_line(cfd, header, sizeof(header)) <= 0) {
+			break;
+		}
+		int t = 0, line = 0;
+		size_t len = 0;
+		if (sscanf(header, "OP %d %d %zu", &t, &line, &len) != 3) {
+			continue;
+		}
+		char *payload = NULL;
+		if (len > 0) {
+			payload = (char *)malloc(len);
+			if (!payload) break;
+			if (recv_all(cfd, payload, len) != 0) {
+				free(payload);
+				break;
+			}
+		}
+		// 先轉發給其它客戶端（不含來源）
+		broadcast_header_payload_except(cfd, header, strlen(header), payload, len);
+		// 套用到本地
+		apply_remote_op((enum LiveOpType)t, line, payload, len);
+		if (payload) free(payload);
+	}
+
+	// 斷線清理
+	pthread_mutex_lock(&live_clients_mutex);
+	live_peer_line[cid] = 0;
+	if (idx >= 0 && idx < MAX_PEERS && live_clients[idx].in_use) {
+		close(live_clients[idx].fd);
+		live_clients[idx].fd = -1;
+		live_clients[idx].in_use = 0;
+		live_clients[idx].id = 0;
+	}
+	pthread_mutex_unlock(&live_clients_mutex);
+	return NULL;
+}
+
+// Host 端：接受新連線
+static void *host_accept_thread(void *arg) {
+	(void)arg;
+	while (live_running) {
+		struct sockaddr_in cliaddr;
+		socklen_t clilen = sizeof(cliaddr);
+		int cfd = accept(live_server_sock, (struct sockaddr *)&cliaddr, &clilen);
+		if (cfd < 0) {
+			if (!live_running) break;
+			continue;
+		}
+		pthread_mutex_lock(&live_clients_mutex);
+		// 超過最大人數則關閉
+		if (next_assign_id > MAX_PEERS) {
+			pthread_mutex_unlock(&live_clients_mutex);
+			close(cfd);
+			continue;
+		}
+		// 找空槽
+		int slot = -1;
+		for (int i = 0; i < MAX_PEERS; i++) {
+			if (!live_clients[i].in_use) { slot = i; break; }
+		}
+		if (slot == -1) {
+			pthread_mutex_unlock(&live_clients_mutex);
+			close(cfd);
+			continue;
+		}
+		live_clients[slot].fd = cfd;
+		live_clients[slot].id = next_assign_id++;
+		live_clients[slot].in_use = 1;
+		// 預設新加入者游標未知（0）
+		live_peer_line[live_clients[slot].id] = 0;
+		int *pidx = (int*)malloc(sizeof(int));
+		*pidx = slot;
+		pthread_create(&live_clients[slot].thread, NULL, host_client_thread, pidx);
+		pthread_mutex_unlock(&live_clients_mutex);
+	}
+	return NULL;
+}
+
+// Client 端：接收主機廣播
+static void *live_thread_func(void *arg) {
+	(void)arg;
+	// 收取循環（client）
+	while (live_running) {
+		char header[128];
+		if (recv_line(live_sock, header, sizeof(header)) <= 0) {
+			break;
+		}
+		int t = 0, line = 0;
+		size_t len = 0;
+		if (sscanf(header, "OP %d %d %zu", &t, &line, &len) != 3) {
+			continue;
+		}
+		char *payload = NULL;
+		if (len > 0) {
+			payload = (char *)malloc(len);
+			if (!payload) break;
+			if (recv_all(live_sock, payload, len) != 0) {
+				free(payload);
+				break;
+			}
+		}
+		apply_remote_op((enum LiveOpType)t, line, payload, len);
+		if (payload) free(payload);
+	}
+	live_running = 0;
+	if (live_sock >= 0) { close(live_sock); live_sock = -1; }
+	return NULL;
+}
+
+static int live_start_host(int port) {
+	live_mode = LIVE_HOST;
+	live_self_id = 1;
+	live_server_sock = socket(AF_INET, SOCK_STREAM, 0);
+	if (live_server_sock < 0) return 0;
+	int opt = 1;
+	setsockopt(live_server_sock, SOL_SOCKET, SO_REUSEADDR, &opt, sizeof(opt));
+	struct sockaddr_in addr;
+	memset(&addr, 0, sizeof(addr));
+	addr.sin_family = AF_INET;
+	addr.sin_addr.s_addr = INADDR_ANY;
+	addr.sin_port = htons((uint16_t)port);
+	if (bind(live_server_sock, (struct sockaddr *)&addr, sizeof(addr)) < 0) return 0;
+	if (listen(live_server_sock, MAX_PEERS) < 0) return 0;
+	live_running = 1;
+	if (pthread_create(&live_thread, NULL, host_accept_thread, NULL) != 0) {
+		live_running = 0;
+		return 0;
+	}
+	// 主機的游標行先記錄
+	if (editors[0].current_line > 0) {
+		live_peer_line[live_self_id] = editors[0].current_line;
+	}
+	return 1;
+}
+
+static int live_start_join(const char *host, int port) {
+	live_mode = LIVE_JOIN;
+	live_self_id = 0; // 等待主機分配
+	live_sock = socket(AF_INET, SOCK_STREAM, 0);
+	if (live_sock < 0) return 0;
+	struct sockaddr_in addr;
+	memset(&addr, 0, sizeof(addr));
+	addr.sin_family = AF_INET;
+	addr.sin_port = htons((uint16_t)port);
+	if (inet_pton(AF_INET, host, &addr.sin_addr) <= 0) {
+		return 0;
+	}
+	if (connect(live_sock, (struct sockaddr *)&addr, sizeof(addr)) < 0) {
+		return 0;
+	}
+	live_running = 1;
+	if (pthread_create(&live_thread, NULL, live_thread_func, NULL) != 0) {
+		live_running = 0;
+		return 0;
+	}
+	return 1;
+}
+
+static void live_stop() {
+	if (live_running) {
+		live_running = 0;
+		// 關閉 socket 以喚醒阻塞
+		if (live_mode == LIVE_JOIN) {
+			if (live_sock >= 0) { shutdown(live_sock, SHUT_RDWR); close(live_sock); live_sock = -1; }
+			pthread_join(live_thread, NULL);
+		} else if (live_mode == LIVE_HOST) {
+			// 關閉所有客戶端
+			pthread_mutex_lock(&live_clients_mutex);
+			for (int i = 0; i < MAX_PEERS; i++) {
+				if (live_clients[i].in_use && live_clients[i].fd >= 0) {
+					shutdown(live_clients[i].fd, SHUT_RDWR);
+					close(live_clients[i].fd);
+				}
+			}
+			pthread_mutex_unlock(&live_clients_mutex);
+			// 關閉 listen 並等待接受線程結束
+			if (live_server_sock >= 0) { shutdown(live_server_sock, SHUT_RDWR); close(live_server_sock); live_server_sock = -1; }
+			pthread_join(live_thread, NULL);
+			// 等待所有客戶端線程
+			pthread_mutex_lock(&live_clients_mutex);
+			for (int i = 0; i < MAX_PEERS; i++) {
+				if (live_clients[i].in_use) {
+					pthread_join(live_clients[i].thread, NULL);
+					live_clients[i].in_use = 0;
+					live_clients[i].fd = -1;
+					live_clients[i].id = 0;
+				}
+			}
+			pthread_mutex_unlock(&live_clients_mutex);
+		}
+	}
+	live_mode = LIVE_NONE;
+}
 
 // 恢復終端設定
 void disable_raw_mode() {
@@ -154,6 +713,9 @@ void clear_screen() {
 
 // 顯示內容時帶行號（支援視窗滾動）
 void print_with_line_numbers(EditorState *ed){
+	// 讀取時鎖定，避免網路執行緒同時修改
+	int ed_idx = (ed == &editors[0]) ? 0 : 1;
+	live_lock_editor(ed_idx);
     char *buffer = ed->buffer;
     int highlight_line = ed->current_line;
     int row_offset = ed->row_offset;
@@ -187,12 +749,29 @@ void print_with_line_numbers(EditorState *ed){
             line_length = strlen(line_start);
         }
         
-        // 如果是要編輯的行，用特殊標記顯示
-        if(line_num == highlight_line){
-            printf("\033[1;32m>>> [行 %d] ", line_num);  // 綠色加粗
-        } else {
-            printf("    [行 %d] ", line_num);
-        }
+		// 前綴：本地或普通
+		if(line_num == highlight_line){
+			printf("\033[1;32m>>> [行 %d] \033[0m", line_num);  // 本地：綠色加粗
+		} else {
+			printf("    [行 %d] ", line_num);
+		}
+		// 若有遠端在此行，顯示它們的ID
+		if (ed_idx == 0 && live_mode != LIVE_NONE) {
+			char ids[128] = {0};
+			int first = 1;
+			for (int i = 1; i <= MAX_PEERS; i++) {
+				if (i == live_self_id) continue;
+				if (live_peer_line[i] == line_num) {
+					char t[8];
+					snprintf(t, sizeof(t), "%s%d", first ? "" : ",", i);
+					strncat(ids, t, sizeof(ids) - strlen(ids) - 1);
+					first = 0;
+				}
+			}
+			if (ids[0] != '\0') {
+				printf("\033[1;36m << R:%s \033[0m", ids); // 青色顯示遠端ID
+			}
+		}
         
         // 如果在搜尋模式且這行有匹配，高亮顯示搜尋詞
         if(ed->search_mode && strlen(ed->search_term) > 0) {
@@ -251,6 +830,7 @@ void print_with_line_numbers(EditorState *ed){
     }
     
     printf("====================================================\n\n");
+	live_unlock_editor(ed_idx);
 }
 
 // 在指定行之後插入新行
@@ -282,6 +862,8 @@ void insert_new_line(char *buffer, int after_line){
     printf("\n✓ 已在第 %d 行之後插入新行\n", after_line);
     printf("按任意鍵繼續...");
     read_key();
+	// 廣播（不帶 payload 的插入）
+	live_broadcast_simple(OP_INSERT_AFTER, after_line);
 }
 
 // 刪除指定行
@@ -332,6 +914,8 @@ int delete_line(char *buffer, int line_to_delete){
     printf("\n✓ 已刪除第 %d 行\n", line_to_delete);
     printf("按任意鍵繼續...");
     read_key();
+	// 廣播刪除
+	live_broadcast_simple(OP_DELETE_LINE, line_to_delete);
     return 1;  // 刪除成功
 }
 
@@ -414,6 +998,8 @@ void paste_line(char *buffer, int after_line){
     printf("內容：%s\n", clipboard);
     printf("按任意鍵繼續...");
     read_key();
+	// 廣播貼上（帶內容）
+	live_broadcast_with_payload(OP_PASTE_AFTER, after_line, clipboard);
 }
 
 // 計算總共有多少個匹配
@@ -546,6 +1132,9 @@ void edit_line(EditorState *ed){
     char *buffer = ed->buffer;
     int current_line = ed->current_line;
     
+	// 進入編輯時廣播目前行號，讓對方看到正在編輯的位置
+	live_broadcast_cursor(current_line);
+
     // 找到要編輯的行
     char *line_ptr = buffer;
     for (int i = 0; i < current_line - 1; i++){
@@ -611,8 +1200,13 @@ void edit_line(EditorState *ed){
         if(key == '\r' || key == '\n'){
             // Enter - 完成編輯
             line_content[content_len] = '\0';
-            strcpy(line_ptr, line_content);
-            strcpy(line_ptr + content_len, after_line);
+			// 寫入時短暫上鎖
+			live_lock_editor((ed == &editors[0]) ? 0 : 1);
+			strcpy(line_ptr, line_content);
+			strcpy(line_ptr + content_len, after_line);
+			live_unlock_editor((ed == &editors[0]) ? 0 : 1);
+			// 廣播更新此行
+			live_broadcast_with_payload(OP_EDIT_LINE, current_line, line_content);
             
             clear_screen();
             printf("\n✓ 已更新行 %d\n", current_line);
@@ -670,7 +1264,10 @@ void edit_line(EditorState *ed){
 void save_editor(EditorState *ed) {
     FILE *file = fopen(ed->filename, "w");
     if(file) {
-        fwrite(ed->buffer, strlen(ed->buffer), 1, file);
+		// 寫入前鎖定，避免與網路執行緒衝突
+		live_lock_editor((ed == &editors[0]) ? 0 : 1);
+		fwrite(ed->buffer, strlen(ed->buffer), 1, file);
+		live_unlock_editor((ed == &editors[0]) ? 0 : 1);
         fclose(file);
     }
 }
@@ -710,28 +1307,67 @@ int init_editor(EditorState *ed, const char *filename) {
 
 int main(int argc,char **argv){
 
-    if(argc < 2){
-        printf("使用方式: %s <filename1> [filename2]\n", argv[0]);
-        printf("  filename1: 第一個要編輯的文件\n");
-        printf("  filename2: (可選) 第二個要編輯的文件\n");
-        printf("  使用 Ctrl+左/右 鍵在兩個文件間切換\n");
-        return 1;
-    }
+	int argi = 1;
+	const char *join_host = NULL;
+	int join_port = 0;
+	int host_port = 0;
+
+	// 參數解析： [--host PORT | --join HOST:PORT] <filename1> [filename2]
+	if (argc >= 3 && strcmp(argv[argi], "--host") == 0) {
+		host_port = atoi(argv[argi + 1]);
+		argi += 2;
+	} else if (argc >= 3 && strcmp(argv[argi], "--join") == 0) {
+		char *hp = argv[argi + 1];
+		char *colon = strchr(hp, ':');
+		if (colon) {
+			*colon = '\0';
+			join_host = hp;
+			join_port = atoi(colon + 1);
+			argi += 2;
+		} else {
+			printf("使用方式: %s [--host PORT | --join HOST:PORT] <filename1> [filename2]\n", argv[0]);
+			return 1;
+		}
+	}
+
+	if(argc - argi < 1){
+		printf("使用方式: %s [--host PORT | --join HOST:PORT] <filename1> [filename2]\n", argv[0]);
+		printf("  filename1: 第一個要編輯的文件\n");
+		printf("  filename2: (可選) 第二個要編輯的文件\n");
+		printf("  使用 Ctrl+左/右 鍵在兩個文件間切換\n");
+		printf("  Live Share: --host 啟動主機；--join 以 HOST:PORT 連線\n");
+		return 1;
+	}
 
     // 初始化編輯器
-    num_editors = (argc >= 3) ? 2 : 1;
+	num_editors = ((argc - argi) >= 2) ? 2 : 1;
     
-    if(!init_editor(&editors[0], argv[1])) {
+	if(!init_editor(&editors[0], argv[argi])) {
         return 1;
     }
     
-    if(num_editors == 2) {
-        if(!init_editor(&editors[1], argv[2])) {
+	if(num_editors == 2) {;
+		if(!init_editor(&editors[1], argv[argi + 1])) {
             return 1;
         }
     }
     
     active_editor = 0;
+
+	// 啟動 Live Share（若有要求）
+	if (host_port > 0) {
+		if (!live_start_host(host_port)) {
+			printf("Live Share 主機啟動失敗（port=%d）\n", host_port);
+		} else {
+			printf("Live Share 主機啟動中，等待連線（port=%d）...\n", host_port);
+		}
+	} else if (join_host && join_port > 0) {
+		if (!live_start_join(join_host, join_port)) {
+			printf("Live Share 無法連線到 %s:%d\n", join_host, join_port);
+		} else {
+			printf("Live Share 已連線到 %s:%d\n", join_host, join_port);
+		}
+	}
     
     // 啟用原始模式來讀取方向鍵
     enable_raw_mode();
@@ -752,6 +1388,11 @@ int main(int argc,char **argv){
         printf("  Ctrl+←/→ - 切換視窗\n");
     }
     printf("  q       - 退出編輯器\n\n");
+	if (live_mode == LIVE_HOST) {
+		printf("[Live Share] 角色：主機（等待/已連線）\n");
+	} else if (live_mode == LIVE_JOIN) {
+		printf("[Live Share] 角色：加入（已連線）\n");
+	}
     printf("編輯模式功能：\n");
     printf("  ←/→      - 左右移動光標\n");
     printf("  字符輸入  - 在光標位置插入\n");
@@ -774,6 +1415,9 @@ int main(int argc,char **argv){
             printf("║  文件: %-35s║\n", ed->filename);
             printf("╚═══════════════════════════════════════════╝\n");
         }
+		if (live_mode != LIVE_NONE) {
+			printf("[Live Share] 模式: %s\n", live_mode == LIVE_HOST ? "主機" : "加入");
+		}
         
         // 顯示文件內容，高亮當前行
         print_with_line_numbers(ed);
@@ -832,6 +1476,8 @@ int main(int argc,char **argv){
                         } else if(ed->current_line >= ed->row_offset + VISIBLE_LINES) {
                             ed->row_offset = ed->current_line - VISIBLE_LINES + 1;
                         }
+						// 廣播游標位置
+						live_broadcast_cursor(ed->current_line);
                     }
                 } else {
                     ed->search_mode = 0;
@@ -857,6 +1503,7 @@ int main(int argc,char **argv){
             // 退出
             clear_screen();
             disable_raw_mode();
+			live_stop();
             printf("\n正在退出編輯器...\n");
             break;
         }
@@ -868,6 +1515,8 @@ int main(int argc,char **argv){
                 if(ed->current_line < ed->row_offset){
                     ed->row_offset = ed->current_line;
                 }
+				// 廣播游標位置
+				live_broadcast_cursor(ed->current_line);
             }
         }
         else if(key == KEY_DOWN){
@@ -878,6 +1527,8 @@ int main(int argc,char **argv){
                 if(ed->current_line >= ed->row_offset + VISIBLE_LINES){
                     ed->row_offset = ed->current_line - VISIBLE_LINES + 1;
                 }
+				// 廣播游標位置
+				live_broadcast_cursor(ed->current_line);
             }
         }
         else if(key == 'n' || key == 'N'){
@@ -899,6 +1550,8 @@ int main(int argc,char **argv){
                     } else if(ed->current_line >= ed->row_offset + VISIBLE_LINES) {
                         ed->row_offset = ed->current_line - VISIBLE_LINES + 1;
                     }
+					// 廣播游標位置
+					live_broadcast_cursor(ed->current_line);
                 }
             } else {
                 // 非搜尋模式：在當前行之後新增一行
@@ -922,6 +1575,8 @@ int main(int argc,char **argv){
                 if(ed->current_line >= ed->row_offset + VISIBLE_LINES){
                     ed->row_offset = ed->current_line - VISIBLE_LINES + 1;
                 }
+				// 廣播游標位置
+				live_broadcast_cursor(ed->current_line);
             }
         }
         else if(key == 'd' || key == 'D'){
@@ -954,6 +1609,8 @@ int main(int argc,char **argv){
                 if(ed->current_line >= ed->row_offset + VISIBLE_LINES){
                     ed->row_offset = ed->current_line - VISIBLE_LINES + 1;
                 }
+				// 廣播游標位置
+				live_broadcast_cursor(ed->current_line);
             }
         }
         else if(key == 'c' || key == 'C'){
@@ -986,6 +1643,8 @@ int main(int argc,char **argv){
                 if(ed->current_line >= ed->row_offset + VISIBLE_LINES){
                     ed->row_offset = ed->current_line - VISIBLE_LINES + 1;
                 }
+                // 廣播游標位置
+                live_broadcast_simple(OP_CURSOR, ed->current_line);
             }
         }
         else if(key == KEY_LEFT || key == KEY_RIGHT){
