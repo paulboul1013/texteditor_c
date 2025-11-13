@@ -1,4 +1,4 @@
-CFLAGS = -Wall -Wextra  -Werror -pedantic -std=c99
+CFLAGS = -Wall -Wextra  -Werror -pedantic -std=c99 -pthread
 
 
 main: main.c
