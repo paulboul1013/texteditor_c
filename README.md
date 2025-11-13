@@ -15,13 +15,13 @@ interface like vi/nano simple text editor
 - live share with many person edit to file same time(most 20 persons can edit，have cursor show)
 
 
-# build：
+# build
 
 ```bash
 make
 ```
 
-# execute：
+# execute
 
 ```bash
 ./main <filename1> [filename2]
@@ -53,18 +53,19 @@ make
   - save again after exit texteditor
 
 
-# Live Share (online edit same together，at most 20 persons)
+# Live Share ()
 
-Built-in tcp P2S (multiple client to single host) online cooperate，support all client show user id and highlight cursor
+Built-in tcp P2S (multiple client to single host) online cooperate at most 20 persons，support all client show user id and highlight cursor  
 
-usage:
- - host mode 
 
+## usage
+ - host mode
+ - 
 ```bash
 ./main --host 5555 <filename1> [filename2]
 ```
 
-- join mode（connect to host）：
+- join mode（connect to host）
 
 ```bash
 ./main --join 127.0.0.1:5555 <filename1> [filename2]
