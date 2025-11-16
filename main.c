@@ -69,6 +69,7 @@ static volatile int live_remote_line = 0; // 已廢棄（保留避免破壞原�
 #define MAX_PEERS 20
 static int live_self_id = 1; // host 為 1；client 由主機指定
 static int live_peer_line[MAX_PEERS + 1] = {0}; // 1..MAX_PEERS 的每位參與者所在行
+static int live_peer_col[MAX_PEERS + 1] = {0};  // 1..MAX_PEERS 的每位參與者所在欄位（內容游標）
 
 // Host 端多連線管理
 typedef struct {
@@ -182,10 +183,10 @@ static void live_broadcast_with_payload(enum LiveOpType t, int line, const char 
 	}
 }
 
-static void live_broadcast_cursor(int current_line) {
-	// 格式："id line"
+static void live_broadcast_cursor(int current_line, int current_col) {
+	// 格式："id line col"
 	char buf[64];
-	int n = snprintf(buf, sizeof(buf), "%d %d", live_self_id, current_line);
+	int n = snprintf(buf, sizeof(buf), "%d %d %d", live_self_id, current_line, current_col);
 	if (n <= 0) return;
 	live_broadcast_with_payload(OP_CURSOR, 0, buf);
 }
@@ -325,16 +326,18 @@ static void apply_remote_op(enum LiveOpType t, int line, const char *payload, si
 		insert_after_silent(ed->buffer, line, tmp);
 		editor_recount_and_clamp(ed);
 	} else if (t == OP_CURSOR) {
-		// payload: "id line"
-		int pid = 0, pline = 0;
+		// payload: "id line col"
+		int pid = 0, pline = 0, pcol = 0;
 		if (payload && plen > 0) {
 			char tmp[64] = {0};
 			size_t copy_len = (plen < sizeof(tmp) - 1) ? plen : sizeof(tmp) - 1;
 			memcpy(tmp, payload, copy_len);
 			tmp[copy_len] = '\0';
-			sscanf(tmp, "%d %d", &pid, &pline);
+			sscanf(tmp, "%d %d %d", &pid, &pline, &pcol);
 			if (pid >= 1 && pid <= MAX_PEERS && pid != live_self_id) {
 				live_peer_line[pid] = pline;
+				if (pcol < 0) pcol = 0;
+				live_peer_col[pid] = pcol;
 			}
 		}
 	} else if (t == OP_HELLO) {
@@ -387,7 +390,7 @@ static void *host_client_thread(void *arg) {
 		for (int i = 1; i <= MAX_PEERS; i++) {
 			if (live_peer_line[i] > 0) {
 				char payload[64];
-				int n = snprintf(payload, sizeof(payload), "%d %d", i, live_peer_line[i]);
+				int n = snprintf(payload, sizeof(payload), "%d %d %d", i, live_peer_line[i], live_peer_col[i]);
 				header_len = snprintf(header, sizeof(header), "OP %d 0 %d\n", (int)OP_CURSOR, n);
 				send_header_payload_to_fd(cfd, header, (size_t)header_len, payload, (size_t)n);
 			}
@@ -424,6 +427,7 @@ static void *host_client_thread(void *arg) {
 	// 斷線清理
 	pthread_mutex_lock(&live_clients_mutex);
 	live_peer_line[cid] = 0;
+	live_peer_col[cid] = 0;
 	if (idx >= 0 && idx < MAX_PEERS && live_clients[idx].in_use) {
 		close(live_clients[idx].fd);
 		live_clients[idx].fd = -1;
@@ -528,6 +532,7 @@ static int live_start_host(int port) {
 	// 主機的游標行先記錄
 	if (editors[0].current_line > 0) {
 		live_peer_line[live_self_id] = editors[0].current_line;
+		live_peer_col[live_self_id] = 0;
 	}
 	return 1;
 }
@@ -755,61 +760,90 @@ void print_with_line_numbers(EditorState *ed){
 		} else {
 			printf("    [行 %d] ", line_num);
 		}
-		// 若有遠端在此行，顯示它們的ID
+		// 準備遠端游標位置（用於在內容中標示），含對應的參與者編號
+		int remote_mark_id[512] = {0};     // 該欄位的第一個遠端 ID
+		char remote_mark_multi[512] = {0};  // 是否有多個遠端重疊於該欄位
+		int remote_eol_id = 0;              // 行尾遠端的第一個 ID
+		int remote_eol_multi = 0;           // 行尾是否多個重疊
 		if (ed_idx == 0 && live_mode != LIVE_NONE) {
-			char ids[128] = {0};
-			int first = 1;
-			for (int i = 1; i <= MAX_PEERS; i++) {
-				if (i == live_self_id) continue;
-				if (live_peer_line[i] == line_num) {
-					char t[8];
-					snprintf(t, sizeof(t), "%s%d", first ? "" : ",", i);
-					strncat(ids, t, sizeof(ids) - strlen(ids) - 1);
-					first = 0;
+			for (int pid = 1; pid <= MAX_PEERS; pid++) {
+				if (pid == live_self_id) continue;
+				if (live_peer_line[pid] == line_num) {
+					int col = live_peer_col[pid];
+					if (col < 0) col = 0;
+					if (col >= 511) col = 511;
+					if (col >= line_length) { // 行尾
+						if (remote_eol_id == 0) remote_eol_id = pid;
+						else remote_eol_multi = 1;
+					} else {
+						if (remote_mark_id[col] == 0) remote_mark_id[col] = pid;
+						else remote_mark_multi[col] = 1;
+					}
 				}
-			}
-			if (ids[0] != '\0') {
-				printf("\033[1;36m << R:%s \033[0m", ids); // 青色顯示遠端ID
 			}
 		}
         
-        // 如果在搜尋模式且這行有匹配，高亮顯示搜尋詞
-        if(ed->search_mode && strlen(ed->search_term) > 0) {
-            char line_content[512];
-            int copy_len = (line_length < 511) ? line_length : 511;
-            strncpy(line_content, line_start, copy_len);
-            line_content[copy_len] = '\0';
-            
-            char *match_pos = line_content;
-            char *last_pos = line_content;
-            int printed = 0;
-            
-            while((match_pos = strstr(match_pos, ed->search_term)) != NULL) {
-                // 打印匹配前的部分
-                printf("%.*s", (int)(match_pos - last_pos), last_pos);
-                // 高亮打印匹配的部分
-                if(line_num == ed->search_result_line && 
-                   (match_pos - line_content) == ed->search_result_offset) {
-                    printf("\033[1;33;7m%.*s\033[0m", (int)strlen(ed->search_term), match_pos);  // 黃色反色（當前匹配）
-                } else {
-                    printf("\033[1;33m%.*s\033[0m", (int)strlen(ed->search_term), match_pos);  // 黃色（其他匹配）
-                }
-                match_pos += strlen(ed->search_term);
-                last_pos = match_pos;
-                printed = 1;
-            }
-            
-            if(printed) {
-                // 打印剩餘的部分
-                printf("%s", last_pos);
-            } else {
-                // 沒有匹配，正常打印
-                printf("%.*s", line_length, line_start);
-            }
-        } else {
-            // 正常打印
-            printf("%.*s", line_length, line_start);
-        }
+        // 先擷取此行內容
+        char line_content[512];
+        int copy_len = (line_length < 511) ? line_length : 511;
+        strncpy(line_content, line_start, copy_len);
+        line_content[copy_len] = '\0';
+		
+		// 準備搜尋匹配標記
+		int match_mask[512] = {0}; // 0:無, 1:匹配, 2:當前匹配
+		if (ed->search_mode && strlen(ed->search_term) > 0) {
+			const char *term = ed->search_term;
+			size_t tlen = strlen(term);
+			if (tlen > 0) {
+				for (int pos = 0; pos + (int)tlen <= copy_len; ) {
+					char *found = strstr(&line_content[pos], term);
+					if (!found) break;
+					int start = (int)(found - line_content);
+					int end = start + (int)tlen;
+					for (int k = start; k < end && k < 512; k++) {
+						match_mask[k] = 1;
+					}
+					if (line_num == ed->search_result_line && start == ed->search_result_offset) {
+						for (int k = start; k < end && k < 512; k++) {
+							match_mask[k] = 2;
+						}
+					}
+					pos = end;
+				}
+			}
+		}
+
+		// 逐字輸出，將遠端游標位置直接套用顏色於內容
+		for (int i = 0; i < copy_len; i++) {
+			int rid = remote_mark_id[i];
+			int multi_here = remote_mark_multi[i];
+			// 先顯示遠端 ID（若多人重疊則顯示 [+]），不再對後續字元套青色反色
+			if (rid || multi_here) {
+				if (multi_here) {
+					printf("\033[1;36m[+]\033[0m");
+				} else {
+					printf("\033[1;36m[%d]\033[0m", rid);
+				}
+			}
+			// 僅處理搜尋高亮
+			if (match_mask[i] == 2) {
+				printf("\033[1;33;7m"); // 當前匹配 黃色反色
+			} else if (match_mask[i] == 1) {
+				printf("\033[1;33m");   // 其他匹配 黃色
+			}
+			printf("%c", line_content[i]);
+			if (match_mask[i]) {
+				printf("\033[0m");
+			}
+		}
+		// 行尾如有遠端游標：僅顯示 ID（或 [+]），不印反色空格
+		if (remote_eol_id || remote_eol_multi) {
+			if (remote_eol_multi) {
+				printf("\033[1;36m[+]\033[0m");
+			} else {
+				printf("\033[1;36m[%d]\033[0m", remote_eol_id);
+			}
+		}
         
         if(line_num == highlight_line){
             printf(" <<<\033[0m\n");  // 重置顏色
@@ -1132,8 +1166,7 @@ void edit_line(EditorState *ed){
     char *buffer = ed->buffer;
     int current_line = ed->current_line;
     
-	// 進入編輯時廣播目前行號，讓對方看到正在編輯的位置
-	live_broadcast_cursor(current_line);
+	//（改至取得初始欄位位置後再廣播）
 
     // 找到要編輯的行
     char *line_ptr = buffer;
@@ -1157,6 +1190,8 @@ void edit_line(EditorState *ed){
     
     int cursor_pos = line_length;  // 光標位置（從行尾開始）
     int content_len = line_length;
+	// 進入編輯時廣播目前行號與欄位
+	live_broadcast_cursor(current_line, cursor_pos);
     
     // 編輯循環
     while(1){
@@ -1226,12 +1261,14 @@ void edit_line(EditorState *ed){
             // 左移光標
             if(cursor_pos > 0){
                 cursor_pos--;
+				live_broadcast_cursor(current_line, cursor_pos);
             }
         }
         else if(key == KEY_RIGHT){
             // 右移光標
             if(cursor_pos < content_len){
                 cursor_pos++;
+				live_broadcast_cursor(current_line, cursor_pos);
             }
         }
         else if(key == 127 || key == '\b'){
@@ -1243,6 +1280,7 @@ void edit_line(EditorState *ed){
                 }
                 cursor_pos--;
                 content_len--;
+				live_broadcast_cursor(current_line, cursor_pos);
             }
         }
         else if(key >= 32 && key <= 126){
@@ -1255,6 +1293,7 @@ void edit_line(EditorState *ed){
                 line_content[cursor_pos] = key;
                 cursor_pos++;
                 content_len++;
+				live_broadcast_cursor(current_line, cursor_pos);
             }
         }
     }
@@ -1476,8 +1515,8 @@ int main(int argc,char **argv){
                         } else if(ed->current_line >= ed->row_offset + VISIBLE_LINES) {
                             ed->row_offset = ed->current_line - VISIBLE_LINES + 1;
                         }
-						// 廣播游標位置
-						live_broadcast_cursor(ed->current_line);
+						// 廣播游標位置（非編輯模式，欄位以 0 表示）
+						live_broadcast_cursor(ed->current_line, 0);
                     }
                 } else {
                     ed->search_mode = 0;
@@ -1515,8 +1554,8 @@ int main(int argc,char **argv){
                 if(ed->current_line < ed->row_offset){
                     ed->row_offset = ed->current_line;
                 }
-				// 廣播游標位置
-				live_broadcast_cursor(ed->current_line);
+				// 廣播游標位置（非編輯模式，欄位以 0 表示）
+				live_broadcast_cursor(ed->current_line, 0);
             }
         }
         else if(key == KEY_DOWN){
@@ -1527,8 +1566,8 @@ int main(int argc,char **argv){
                 if(ed->current_line >= ed->row_offset + VISIBLE_LINES){
                     ed->row_offset = ed->current_line - VISIBLE_LINES + 1;
                 }
-				// 廣播游標位置
-				live_broadcast_cursor(ed->current_line);
+				// 廣播游標位置（非編輯模式，欄位以 0 表示）
+				live_broadcast_cursor(ed->current_line, 0);
             }
         }
         else if(key == 'n' || key == 'N'){
@@ -1550,8 +1589,8 @@ int main(int argc,char **argv){
                     } else if(ed->current_line >= ed->row_offset + VISIBLE_LINES) {
                         ed->row_offset = ed->current_line - VISIBLE_LINES + 1;
                     }
-					// 廣播游標位置
-					live_broadcast_cursor(ed->current_line);
+					// 廣播游標位置（非編輯模式，欄位以 0 表示）
+					live_broadcast_cursor(ed->current_line, 0);
                 }
             } else {
                 // 非搜尋模式：在當前行之後新增一行
@@ -1575,8 +1614,8 @@ int main(int argc,char **argv){
                 if(ed->current_line >= ed->row_offset + VISIBLE_LINES){
                     ed->row_offset = ed->current_line - VISIBLE_LINES + 1;
                 }
-				// 廣播游標位置
-				live_broadcast_cursor(ed->current_line);
+				// 廣播游標位置（非編輯模式，欄位以 0 表示）
+				live_broadcast_cursor(ed->current_line, 0);
             }
         }
         else if(key == 'd' || key == 'D'){
@@ -1609,8 +1648,8 @@ int main(int argc,char **argv){
                 if(ed->current_line >= ed->row_offset + VISIBLE_LINES){
                     ed->row_offset = ed->current_line - VISIBLE_LINES + 1;
                 }
-				// 廣播游標位置
-				live_broadcast_cursor(ed->current_line);
+				// 廣播游標位置（非編輯模式，欄位以 0 表示）
+				live_broadcast_cursor(ed->current_line, 0);
             }
         }
         else if(key == 'c' || key == 'C'){
@@ -1643,8 +1682,8 @@ int main(int argc,char **argv){
                 if(ed->current_line >= ed->row_offset + VISIBLE_LINES){
                     ed->row_offset = ed->current_line - VISIBLE_LINES + 1;
                 }
-                // 廣播游標位置
-                live_broadcast_simple(OP_CURSOR, ed->current_line);
+                // 廣播游標位置（非編輯模式，欄位以 0 表示）
+                live_broadcast_cursor(ed->current_line, 0);
             }
         }
         else if(key == KEY_LEFT || key == KEY_RIGHT){
