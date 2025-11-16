@@ -846,7 +846,7 @@ void print_with_line_numbers(EditorState *ed){
 		}
         
         if(line_num == highlight_line){
-            printf(" <<<\033[0m\n");  // 重置顏色
+            printf(" \033[1;32m<<<\033[0m\n");  // 行尾也以綠色加粗顯示
         } else {
             printf("\n");
         }
