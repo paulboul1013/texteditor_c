@@ -290,9 +290,9 @@ static void undo_last_action(EditorState *ed) {
     ed->suppress_undo = 0;
     // 自動保存與訊息
     save_editor(ed);
-    printf("\n✓ 已復原上一個動作\n");
-    printf("按任意鍵繼續...");
-    read_key();
+    // printf("\n✓ 已復原上一個動作\n");
+    // printf("按任意鍵繼續...");
+    // read_key();
     // 廣播目前游標（非編輯模式，欄位用 0）
     live_broadcast_cursor(ed->current_line, 0);
 }
@@ -988,9 +988,9 @@ void insert_new_line(EditorState *ed, int after_line){
     // 推入逆操作：刪除新插入的行
     push_undo(ed, UNDO_DELETE_LINE, after_line + 1, NULL);
 
-    printf("\n✓ 已在第 %d 行之後插入新行\n", after_line);
-    printf("按任意鍵繼續...");
-    read_key();
+    // printf("\n✓ 已在第 %d 行之後插入新行\n", after_line);
+    // printf("按任意鍵繼續...");
+    // read_key();
 	// 廣播（不帶 payload 的插入）
 	live_broadcast_simple(OP_INSERT_AFTER, after_line);
 }
@@ -1055,9 +1055,10 @@ int delete_line(EditorState *ed, int line_to_delete){
     // 推入逆操作：在前一行之後插回被刪除的內容
     push_undo(ed, UNDO_INSERT_AFTER_WITH_CONTENT, line_to_delete - 1, deleted_content);
 
-    printf("\n✓ 已刪除第 %d 行\n", line_to_delete);
-    printf("按任意鍵繼續...");
-    read_key();
+    // printf("\n✓ 已刪除第 %d 行\n", line_to_delete);
+    // printf("按任意鍵繼續...");
+    // read_key();
+
 	// 廣播刪除
 	live_broadcast_simple(OP_DELETE_LINE, line_to_delete);
     return 1;  // 刪除成功
@@ -1098,10 +1099,10 @@ void copy_line(char *buffer, int line_to_copy){
     clipboard[line_length] = '\0';
     clipboard_has_content = 1;
     
-    printf("\n✓ 已複製第 %d 行到剪貼板\n", line_to_copy);
-    printf("內容：%s\n", clipboard);
-    printf("按任意鍵繼續...");
-    read_key();
+    // printf("\n✓ 已複製第 %d 行到剪貼板\n", line_to_copy);
+    // printf("內容：%s\n", clipboard);
+    // printf("按任意鍵繼續...");
+    // read_key();
 }
 
 // 將剪貼板內容貼上到指定行之後
@@ -1141,10 +1142,10 @@ void paste_line(EditorState *ed, int after_line){
     // 推入逆操作：刪除新貼上的行
     push_undo(ed, UNDO_DELETE_LINE, after_line + 1, NULL);
 
-    printf("\n✓ 已在第 %d 行之後貼上內容\n", after_line);
-    printf("內容：%s\n", clipboard);
-    printf("按任意鍵繼續...");
-    read_key();
+    // printf("\n✓ 已在第 %d 行之後貼上內容\n", after_line);
+    // printf("內容：%s\n", clipboard);
+    // printf("按任意鍵繼續...");
+    // read_key();
 	// 廣播貼上（帶內容）
 	live_broadcast_with_payload(OP_PASTE_AFTER, after_line, clipboard);
 }
@@ -1363,19 +1364,14 @@ void edit_line(EditorState *ed){
 			live_unlock_editor((ed == &editors[0]) ? 0 : 1);
 			// 廣播更新此行
 			live_broadcast_with_payload(OP_EDIT_LINE, current_line, line_content);
-            
-            clear_screen();
-            printf("\n✓ 已更新行 %d\n", current_line);
-            printf("按任意鍵繼續...");
-            read_key();
             break;
         }
         else if(key == '\033'){
             // ESC - 取消編輯
-            clear_screen();
-            printf("\n✗ 已取消編輯\n");
-            printf("按任意鍵繼續...");
-            read_key();
+            // clear_screen();
+            // printf("\n✗ 已取消編輯\n");
+            // printf("按任意鍵繼續...");
+            // read_key();
             break;
         }
         else if(key == KEY_LEFT){
@@ -1585,13 +1581,22 @@ int main(int argc,char **argv){
         
         // 顯示提示信息
         printf("\n");
-        printf("當前選擇：第 %d 行 (共 %d 行)%s%s\n", 
+        printf("當前選擇：第 %d 行 (共 %d 行)%s%s ", 
                ed->current_line, ed->total_lines, 
-               clipboard_has_content ? "  [剪貼板: ✓]" : "",
+               clipboard_has_content ? "  [剪貼板:" : "",
                ed->search_mode ? "  [搜尋: " : "");
         if(ed->search_mode) {
             printf("%s] (%d/%d)", ed->search_term, ed->current_match, ed->total_matches);
         }
+		if (clipboard_has_content) {
+			// 顯示剪貼板內容預覽（最多 40 字）
+			int clip_len = (int)strlen(clipboard);
+			int show_len = (clip_len > 40) ? 40 : clip_len;
+			char clip_preview[64] = {0};
+			strncpy(clip_preview, clipboard, show_len);
+			clip_preview[show_len] = '\0';
+			printf(" %s%s]", clip_preview, (clip_len > show_len) ? "..." : "");
+		}
         printf("\n");
         if(ed->search_mode) {
             printf("操作：[n] 下一個匹配  [ESC] 退出搜尋  [↑↓] 移動  [Enter] 編輯  [q] 退出\n");
@@ -1841,11 +1846,11 @@ int main(int argc,char **argv){
     }
     
     if(num_editors == 2) {
-        printf("✓ 文件已保存並退出:\n");
+        printf("文件已保存並退出:\n");
         printf("  - %s\n", editors[0].filename);
         printf("  - %s\n", editors[1].filename);
     } else {
-        printf("✓ 文件已保存並退出: %s\n", editors[0].filename);
+        printf("文件已保存並退出: %s\n", editors[0].filename);
     }
     printf("再見！\n\n");
 
