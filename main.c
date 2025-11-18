@@ -20,6 +20,12 @@ int clipboard_has_content = 0;  // 標記剪貼板是否有內容
 
 // 編輯器狀態結構體（每個文件一個）
 typedef struct {
+    int type;               // 逆操作類型
+    int line;               // 相關行號
+    char content[512];      // 逆操作所需內容（例如原行內容或插入內容）
+} UndoEntry;
+
+typedef struct {
     char filename[256];
     char buffer[1024];
     int current_line;
@@ -31,6 +37,9 @@ typedef struct {
     int search_result_offset;
     int total_matches;
     int current_match;
+    UndoEntry undo_stack[100];
+    int undo_top;
+    int suppress_undo;  // 正在執行復原時避免將操作再次推入堆疊
 } EditorState;
 
 // 全局變數
@@ -40,6 +49,16 @@ int active_editor = 0;   // 當前活動的編輯器（0或1）
 
 // 函式前置宣告
 int count_lines(char *buffer);
+void save_editor(EditorState *ed);
+void insert_new_line(EditorState *ed, int after_line);
+int delete_line(EditorState *ed, int line_to_delete);
+void paste_line(EditorState *ed, int after_line);
+static void undo_last_action(EditorState *ed);
+// 供 undo 使用之前置宣告，避免隱式宣告
+static void replace_line_silent(char *buffer, int line_no, const char *new_content);
+static void insert_after_silent(char *buffer, int after_line, const char *payload);
+static void delete_line_silent(char *buffer, int line_to_delete);
+char read_key();
 
 // ===== Live Share（即時共同編輯）相關 =====
 enum {
@@ -56,6 +75,14 @@ enum LiveOpType {
 	OP_PASTE_AFTER = 5,
 	OP_CURSOR = 6,
 	OP_HELLO = 7
+};
+
+// Undo 逆操作類型
+enum UndoOpType {
+	UNDO_NONE = 0,
+	UNDO_SET_LINE = 1,                    // 將指定行設定為 content
+	UNDO_DELETE_LINE = 2,                 // 刪除指定行
+	UNDO_INSERT_AFTER_WITH_CONTENT = 3    // 在 line 之後插入 content
 };
 
 static int live_mode = LIVE_NONE;       // 0: 關閉, 1: 主機, 2: 加入
@@ -203,6 +230,71 @@ static void editor_recount_and_clamp(EditorState *ed) {
 	if (ed->current_line < ed->row_offset) {
 		ed->row_offset = ed->current_line;
 	}
+}
+
+// ===== Undo 工具 =====
+static void push_undo(EditorState *ed, int type, int line, const char *content) {
+    if (!ed || ed->suppress_undo) return;
+    if (ed->undo_top >= (int)(sizeof(ed->undo_stack) / sizeof(ed->undo_stack[0]))) {
+        // 滿了就移除最舊的一個
+        for (int i = 1; i < ed->undo_top; i++) {
+            ed->undo_stack[i - 1] = ed->undo_stack[i];
+        }
+        ed->undo_top--;
+    }
+    UndoEntry *e = &ed->undo_stack[ed->undo_top++];
+    e->type = type;
+    e->line = line;
+    if (content) {
+        strncpy(e->content, content, sizeof(e->content) - 1);
+        e->content[sizeof(e->content) - 1] = '\0';
+    } else {
+        e->content[0] = '\0';
+    }
+}
+
+static void undo_last_action(EditorState *ed) {
+    if (!ed) return;
+    if (ed->undo_top <= 0) {
+        printf("\n✗ 沒有可復原的動作\n");
+        printf("按任意鍵繼續...");
+        read_key();
+        return;
+    }
+    UndoEntry entry = ed->undo_stack[--ed->undo_top];
+    int ed_idx = (ed == &editors[0]) ? 0 : 1;
+    ed->suppress_undo = 1;
+    live_lock_editor(ed_idx);
+    if (entry.type == UNDO_SET_LINE) {
+        replace_line_silent(ed->buffer, entry.line, entry.content);
+        live_unlock_editor(ed_idx);
+        editor_recount_and_clamp(ed);
+        ed->current_line = entry.line;
+        live_broadcast_with_payload(OP_EDIT_LINE, entry.line, entry.content);
+    } else if (entry.type == UNDO_DELETE_LINE) {
+        delete_line_silent(ed->buffer, entry.line);
+        live_unlock_editor(ed_idx);
+        editor_recount_and_clamp(ed);
+        if (ed->current_line > ed->total_lines) ed->current_line = ed->total_lines;
+        if (ed->current_line < 1) ed->current_line = 1;
+        live_broadcast_simple(OP_DELETE_LINE, entry.line);
+    } else if (entry.type == UNDO_INSERT_AFTER_WITH_CONTENT) {
+        insert_after_silent(ed->buffer, entry.line, entry.content);
+        live_unlock_editor(ed_idx);
+        editor_recount_and_clamp(ed);
+        ed->current_line = entry.line + 1;
+        live_broadcast_with_payload(OP_PASTE_AFTER, entry.line, entry.content);
+    } else {
+        live_unlock_editor(ed_idx);
+    }
+    ed->suppress_undo = 0;
+    // 自動保存與訊息
+    save_editor(ed);
+    printf("\n✓ 已復原上一個動作\n");
+    printf("按任意鍵繼續...");
+    read_key();
+    // 廣播目前游標（非編輯模式，欄位用 0）
+    live_broadcast_cursor(ed->current_line, 0);
 }
 
 // 在指定行替換為新內容（不包含換行），保留行後剩餘內容
@@ -868,9 +960,9 @@ void print_with_line_numbers(EditorState *ed){
 }
 
 // 在指定行之後插入新行
-void insert_new_line(char *buffer, int after_line){
+void insert_new_line(EditorState *ed, int after_line){
     // 找到插入位置
-    char *insert_pos = buffer;
+    char *insert_pos = ed->buffer;
     
     if(after_line > 0){
         for (int i = 0; i < after_line; i++){
@@ -879,7 +971,7 @@ void insert_new_line(char *buffer, int after_line){
                 insert_pos = next + 1;
             } else {
                 // 如果到了文件末尾但沒有換行符，先添加一個
-                insert_pos = buffer + strlen(buffer);
+                insert_pos = ed->buffer + strlen(ed->buffer);
                 break;
             }
         }
@@ -893,6 +985,9 @@ void insert_new_line(char *buffer, int after_line){
     strcpy(insert_pos, "\n");
     strcpy(insert_pos + 1, after_content);
     
+    // 推入逆操作：刪除新插入的行
+    push_undo(ed, UNDO_DELETE_LINE, after_line + 1, NULL);
+
     printf("\n✓ 已在第 %d 行之後插入新行\n", after_line);
     printf("按任意鍵繼續...");
     read_key();
@@ -901,9 +996,9 @@ void insert_new_line(char *buffer, int after_line){
 }
 
 // 刪除指定行
-int delete_line(char *buffer, int line_to_delete){
+int delete_line(EditorState *ed, int line_to_delete){
     // 如果文件只有一行，不允許刪除
-    int total = count_lines(buffer);
+    int total = count_lines(ed->buffer);
     if(total <= 1){
         printf("\n✗ 無法刪除：文件至少需要保留一行\n");
         printf("按任意鍵繼續...");
@@ -912,7 +1007,7 @@ int delete_line(char *buffer, int line_to_delete){
     }
     
     // 找到要刪除的行的起始位置
-    char *line_start = buffer;
+    char *line_start = ed->buffer;
     for(int i = 0; i < line_to_delete - 1; i++){
         char *next = strchr(line_start, '\n');
         if(next){
@@ -928,6 +1023,18 @@ int delete_line(char *buffer, int line_to_delete){
     // 找到要刪除的行的結束位置（下一個換行符）
     char *line_end = strchr(line_start, '\n');
     
+    // 保存將被刪除的內容（不包含換行）
+    char deleted_content[512] = {0};
+    int line_length = 0;
+    if(line_end){
+        line_length = (int)(line_end - line_start);
+    } else {
+        line_length = (int)strlen(line_start);
+    }
+    if (line_length > 511) line_length = 511;
+    strncpy(deleted_content, line_start, line_length);
+    deleted_content[line_length] = '\0';
+
     // 保存要刪除行之後的內容
     char after_content[512] = {0};
     if(line_end){
@@ -938,13 +1045,16 @@ int delete_line(char *buffer, int line_to_delete){
     } else {
         // 如果這是最後一行且沒有換行符
         // 需要刪除前一個換行符
-        if(line_start > buffer && *(line_start - 1) == '\n'){
+        if(line_start > ed->buffer && *(line_start - 1) == '\n'){
             *(line_start - 1) = '\0';
         } else {
             *line_start = '\0';
         }
     }
     
+    // 推入逆操作：在前一行之後插回被刪除的內容
+    push_undo(ed, UNDO_INSERT_AFTER_WITH_CONTENT, line_to_delete - 1, deleted_content);
+
     printf("\n✓ 已刪除第 %d 行\n", line_to_delete);
     printf("按任意鍵繼續...");
     read_key();
@@ -995,7 +1105,7 @@ void copy_line(char *buffer, int line_to_copy){
 }
 
 // 將剪貼板內容貼上到指定行之後
-void paste_line(char *buffer, int after_line){
+void paste_line(EditorState *ed, int after_line){
     if(!clipboard_has_content){
         printf("\n✗ 剪貼板為空，請先複製內容\n");
         printf("按任意鍵繼續...");
@@ -1004,7 +1114,7 @@ void paste_line(char *buffer, int after_line){
     }
     
     // 找到插入位置（在指定行之後）
-    char *insert_pos = buffer;
+    char *insert_pos = ed->buffer;
     
     if(after_line > 0){
         for(int i = 0; i < after_line; i++){
@@ -1013,7 +1123,7 @@ void paste_line(char *buffer, int after_line){
                 insert_pos = next + 1;
             } else {
                 // 如果到了文件末尾但沒有換行符，先添加一個
-                insert_pos = buffer + strlen(buffer);
+                insert_pos = ed->buffer + strlen(ed->buffer);
                 break;
             }
         }
@@ -1028,6 +1138,9 @@ void paste_line(char *buffer, int after_line){
     strcpy(insert_pos + strlen(clipboard), "\n");
     strcpy(insert_pos + strlen(clipboard) + 1, after_content);
     
+    // 推入逆操作：刪除新貼上的行
+    push_undo(ed, UNDO_DELETE_LINE, after_line + 1, NULL);
+
     printf("\n✓ 已在第 %d 行之後貼上內容\n", after_line);
     printf("內容：%s\n", clipboard);
     printf("按任意鍵繼續...");
@@ -1235,6 +1348,14 @@ void edit_line(EditorState *ed){
         if(key == '\r' || key == '\n'){
             // Enter - 完成編輯
             line_content[content_len] = '\0';
+			// 推入逆操作：記錄原始行內容
+			{
+				char orig_content[512] = {0};
+				int orig_len = line_length < 511 ? line_length : 511;
+				strncpy(orig_content, line_ptr, orig_len);
+				orig_content[orig_len] = '\0';
+				push_undo(ed, UNDO_SET_LINE, current_line, orig_content);
+			}
 			// 寫入時短暫上鎖
 			live_lock_editor((ed == &editors[0]) ? 0 : 1);
 			strcpy(line_ptr, line_content);
@@ -1423,6 +1544,7 @@ int main(int argc,char **argv){
     printf("  d       - 刪除當前行\n");
     printf("  c       - 複製當前行\n");
     printf("  p       - 貼上複製的內容\n");
+    printf("  u       - 復原上一個動作\n");
     if(num_editors == 2) {
         printf("  Ctrl+←/→ - 切換視窗\n");
     }
@@ -1475,9 +1597,9 @@ int main(int argc,char **argv){
             printf("操作：[n] 下一個匹配  [ESC] 退出搜尋  [↑↓] 移動  [Enter] 編輯  [q] 退出\n");
         } else {
             if(num_editors == 2) {
-                printf("操作：[f] 搜尋  [↑↓] 移動  [Enter] 編輯  [n] 新增  [d] 刪除  [c] 複製  [p] 貼上  [Ctrl+←/→] 切換  [q] 退出\n");
+                printf("操作：[f] 搜尋  [↑↓] 移動  [Enter] 編輯  [n] 新增  [d] 刪除  [c] 複製  [p] 貼上  [u] 復原  [Ctrl+←/→] 切換  [q] 退出\n");
             } else {
-                printf("操作：[f] 搜尋  [↑↓] 移動  [Enter] 編輯  [n] 新增  [d] 刪除  [c] 複製  [p] 貼上  [q] 退出\n");
+                printf("操作：[f] 搜尋  [↑↓] 移動  [Enter] 編輯  [n] 新增  [d] 刪除  [c] 複製  [p] 貼上  [u] 復原  [q] 退出\n");
             }
         }
         
@@ -1597,7 +1719,7 @@ int main(int argc,char **argv){
                 clear_screen();
                 print_with_line_numbers(ed);
 
-                insert_new_line(ed->buffer, ed->current_line);
+                insert_new_line(ed, ed->current_line);
                 
                 // 自動保存
                 save_editor(ed);
@@ -1624,7 +1746,7 @@ int main(int argc,char **argv){
             print_with_line_numbers(ed);
             
             // 嘗試刪除當前行
-            int deleted = delete_line(ed->buffer, ed->current_line);
+            int deleted = delete_line(ed, ed->current_line);
             
             if(deleted){
                 // 自動保存
@@ -1664,7 +1786,7 @@ int main(int argc,char **argv){
             clear_screen();
             print_with_line_numbers(ed);
             
-            paste_line(ed->buffer, ed->current_line);
+            paste_line(ed, ed->current_line);
             
             // 自動保存
             save_editor(ed);
@@ -1685,6 +1807,14 @@ int main(int argc,char **argv){
                 // 廣播游標位置（非編輯模式，欄位以 0 表示）
                 live_broadcast_cursor(ed->current_line, 0);
             }
+        }
+        else if(key == 'u' || key == 'U'){
+            // 復原上一個動作
+            clear_screen();
+            print_with_line_numbers(ed);
+            undo_last_action(ed);
+            // 狀態已在復原過程中更新並保存，這裡再保險一次視窗邊界
+            editor_recount_and_clamp(ed);
         }
         else if(key == KEY_LEFT || key == KEY_RIGHT){
             // 左右方向鍵在主選單中不執行任何操作（僅在編輯模式中使用）
